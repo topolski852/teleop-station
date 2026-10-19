@@ -1,3 +1,5 @@
 # teleop_station runtime deps. The shared hardware layer (core/) needs numpy + pydantic.
 numpy>=1.24
 pydantic>=2.0
+# Camera measurement (teleop_station.vision): AprilTag + ChArUco live in the contrib build.
+opencv-contrib-python>=4.8

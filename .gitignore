@@ -15,3 +15,6 @@ build/
 
 # misc
 .DS_Store
+
+# Camera: generated print sheets (scripts/make_targets.py)
+targets/

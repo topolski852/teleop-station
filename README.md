@@ -16,7 +16,13 @@ runs from [`humanoid-control`](https://github.com/topolski852/humanoid-control) 
   submodule**, shared with humanoid-control. It holds the CAN daemon (`core/daemon/`), the
   daemon client, the limb layout and the arm math (kinematics, teleop, calibration, operator
   profiles). `humanoid_core` at the repo root is a symlink into it.
-- `teleop_station/`: what only the station needs (empty for now).
+- `teleop_station/`: what only the station needs.
+  - `vision/`: the camera as a measuring instrument for the accuracy test (roadmap 2).
+    AprilTag 36h11 poses, with the wrist tags reported in the frame of a base tag fixed to
+    the station, and averaging over the frames at each stop.
+- `scripts/`: `make_targets.py` (print sheets: tags and the ChArUco board),
+  `calibrate_camera.py` (camera intrinsics), `track_tags.py` (live wrist positions and the
+  camera's noise floor).
 - `tests/`: offline tests, no robot needed. Run each one with `python tests/test_<name>.py`.
 
 ```bash
@@ -26,6 +32,23 @@ cd teleop-station
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python tests/test_core_link.py
 ```
+
+### Setting up the camera
+
+Nothing here moves an arm.
+
+1. `python scripts/make_targets.py`, then print `targets/tags.png` and `targets/charuco.png`
+   at 100% on matte paper and mount them flat. Check the 100 mm bar, then measure each tag's
+   black square and one board square with calipers. Use those numbers from here on.
+2. Fix the camera and lock it: manual focus, fixed zoom, manual exposure. On a webcam
+   the scripts ask the driver to lock these (check what `camera:` reports); through an HDMI
+   capture card, set them on the camera body.
+3. `python scripts/calibrate_camera.py --source /dev/video0 --square <m> --width W --height H
+   --out calib/<camera>.json`. Aim for RMS under 0.5 px. Redo it if focus or zoom ever moves.
+4. Glue tag 0 to the station base, flat, where it stays in view for every pose, and a wrist tag
+   on each wrist. `python scripts/track_tags.py --source /dev/video0 --calib calib/<camera>.json
+   --size 0=<m> --size 1=<m> --size 2=<m>`. With nothing moving, the `±` spread is the
+   noise floor, the finest repeatability this setup can measure.
 
 A fix to the daemon or the arm math goes into humanoid-core, not here. Then move the `core/`
 pointer forward in this repo (see core's README).
