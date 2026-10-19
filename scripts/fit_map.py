@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 """Fit the camera-to-encoder map: arm kinematics against the tag positions the camera saw.
 
-    python scripts/fit_map.py runs/map_20261019T162448.jsonl [more runs ...]
+    python scripts/fit_map.py runs/map_20261019T182231.jsonl [more runs ...] \\
+        --out calib/arm_map.json
 
 Reads the ``frame`` lines of ``record_map.py`` runs, finds the moments each arm held still
-(``--still-deg`` over ``--still-s``), averages each into one pose, and fits, per arm:
+(``--still-deg`` over ``--still-s``), averages each into one pose, and fits both arms at once:
 
-- the arm's base pose in the station reference frame (6),
+- **one** base pose for the torso in the station reference frame (6). Both arms hang off the
+  same torso; fitting a base per arm let each arm settle into a mirror-image solution,
 - where each tag sits on its link (3 each): shoulder_roll tag on the roll link, wrist tag on
   the elbow link (it doesn't turn with the wrist), hand tag on the wrist link,
-- a zero offset for shoulder roll, shoulder yaw and elbow. Shoulder pitch's zero is a rotation
-  of the whole arm about its own axis, the same thing as rotating the base, so the base
-  absorbs it; the wrist's needs tag orientation (see FIT_OFFSETS).
+- a zero offset per arm for shoulder roll, shoulder yaw and elbow, and the right shoulder
+  pitch's zero relative to the left's (a common pitch offset is a rotation of the base about
+  the shoulder axis, so the base absorbs it; the wrist's zero needs tag orientation),
+- optionally (``--coupling``) a pitch-to-roll coupling per arm: roll_true = roll + c * pitch.
 
-Prediction: ``tag_in_ref = base @ FK(q_encoder + offset)[link] @ tag_on_link``, with FK from
-the URDF geometry in core. The residuals are what the encoders plus nominal geometry can't
-explain: link-length errors, joint coupling, backlash, camera error. The fitted zero
-offsets say how far each joint's calibrated zero is from where the camera says it is.
+It also tries both directions for each shoulder pitch (the encoder counting with or against
+the URDF axis) and keeps the best. On the bench (2026-10-19) **both** came out reversed:
+148 mm RMS as the URDF has them, 4.8 mm reversed.
+
+Prediction: ``tag_in_ref = base @ FK(sign * q_encoder + offset)[link] @ tag_on_link``, with FK
+from the URDF geometry in core. The residuals are what the encoders plus nominal geometry
+can't explain: link-length errors, backlash, flex, camera error. The fitted zero offsets say
+how far each joint's calibrated zero is from where the camera says it is.
+
+``--out`` writes the model as JSON for ``scripts/view_map.py`` (``StationMap.load``).
 """
 from __future__ import annotations
 
@@ -229,29 +238,197 @@ def report(model, x, J, poses):
             "base_R": R.tolist(), "base_t_mm": (t * 1000).tolist(), "n_poses": len(poses)}
 
 
+SIDES = ("left", "right")
+N_ARM = 9 + 3          # 3 tag points + roll/yaw/elbow zero
+
+
+class StationMap:
+    """Both arms on one base. ``x`` = base (6) | left (12) | right (12) | right pitch zero |
+    [coupling left, right]."""
+
+    def __init__(self, poses: dict, pitch_sign=(1.0, 1.0), roll_seed=(0.0, 0.0), coupling=False):
+        self.poses = poses
+        self.arms = {s: ArmModel(s) for s in SIDES}
+        for s, sign in zip(SIDES, pitch_sign):
+            self.arms[s].chain.frame_sign = np.array([sign, 1, 1, 1, 1.0])
+        self.roll_seed = dict(zip(SIDES, roll_seed))
+        self.coupling = coupling
+        self.n = 6 + 2 * N_ARM + 1 + (2 if coupling else 0)
+
+    def arm_params(self, x, side):
+        k = 6 + (0 if side == "left" else N_ARM)
+        on = {tag: x[k + 3 * j: k + 3 * j + 3] for j, tag in enumerate(TAG_LINK)}
+        dq = np.zeros(5)
+        dq[[1, 2, 3]] = x[k + 9: k + 12]
+        dq[1] += self.roll_seed[side]
+        if side == "right":
+            dq[0] = x[6 + 2 * N_ARM]
+        c = x[6 + 2 * N_ARM + 1 + SIDES.index(side)] if self.coupling else 0.0
+        return on, dq, c
+
+    def joint_angles(self, side, Q, x):
+        """Encoder angles (N,5) -> the URDF-frame angles the fitted model uses."""
+        arm = self.arms[side]
+        on, dq, c = self.arm_params(x, side)
+        q = arm.chain.device_to_urdf(np.atleast_2d(Q)).copy()
+        q[:, 1] += c * q[:, 0]
+        return q + dq
+
+    def residuals(self, x):
+        R, t = rodrigues(x[:3]), x[3:6]
+        out = []
+        for side in SIDES:
+            arm = self.arms[side]
+            arm._index(self.poses[side])
+            on, _, _ = self.arm_params(x, side)
+            F = arm.frames_batch(self.joint_angles(side, arm._Q, x))
+            Fo = F[arm._obs_link, arm._obs_pose]
+            off = np.array([on[g] for g in arm._obs_tag])
+            local = np.einsum("mij,mj->mi", Fo[:, :3, :3], off) + Fo[:, :3, 3]
+            out.append(((local @ R.T + t) * 1000 - arm._obs_p).ravel())
+        return np.concatenate(out)
+
+    def initial_guess(self):
+        A, B = [], []
+        for side in SIDES:
+            arm = self.arms[side]
+            for q, obs, _ in self.poses[side]:
+                dq = np.zeros(5); dq[1] = self.roll_seed[side]
+                F = arm.chain.frames(arm.chain.device_to_urdf(q) + dq)
+                for tag, (p, _, _) in obs.items():
+                    A.append(F[TAG_LINK[tag]][:3, 3]); B.append(p / 1000)
+        A, B = np.array(A), np.array(B)
+        ca, cb = A.mean(0), B.mean(0)
+        U, _, Vt = np.linalg.svd((A - ca).T @ (B - cb))
+        R = Vt.T @ np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U.T))]) @ U.T
+        x = np.zeros(self.n)
+        x[:3] = cv2.Rodrigues(R)[0].ravel()
+        x[3:6] = cb - R @ ca
+        return x
+
+    def to_json(self, x, J, r) -> dict:
+        dof = max(1, r.size - self.n)
+        sd = np.sqrt(np.diag(np.linalg.pinv(J.T @ J) * ((r ** 2).sum() / dof)))
+        out = {"base": {"R": rodrigues(x[:3]).tolist(), "t_m": x[3:6].tolist()},
+               "residual_rms_mm": float(np.sqrt((r.reshape(-1, 3) ** 2).sum(1).mean())), "arms": {}}
+        for side in SIDES:
+            on, dq, c = self.arm_params(x, side)
+            k = 6 + (0 if side == "left" else N_ARM)
+            sdq = np.zeros(5); sdq[[1, 2, 3]] = sd[k + 9: k + 12]
+            if side == "right":
+                sdq[0] = sd[6 + 2 * N_ARM]
+            out["arms"][side] = {
+                "joints": [f"{side}_{j}_joint" for j in JOINTS],
+                "frame_sign": self.arms[side].chain.frame_sign.tolist(),
+                "zero_offset_rad": dq.tolist(), "zero_offset_sd_rad": sdq.tolist(),
+                "pitch_roll_coupling": float(c),
+                "tag_on_link_m": {tag: p.tolist() for tag, p in on.items()},
+                "tag_link": dict(TAG_LINK)}
+        return out
+
+
+class LoadedMap:
+    """A fitted map from JSON: encoder angles -> tag and joint positions in the reference frame."""
+
+    def __init__(self, d: dict):
+        self.d = d
+        self.R, self.t = np.array(d["base"]["R"]), np.array(d["base"]["t_m"])
+        self.chains = {}
+        for side, a in d["arms"].items():
+            c = ArmChain(a["joints"])
+            c.frame_sign = np.array(a["frame_sign"])
+            self.chains[side] = c
+
+    @classmethod
+    def load(cls, path) -> "LoadedMap":
+        return cls(json.loads(Path(path).read_text()))
+
+    def angles(self, side, q_device, nominal=False):
+        q = np.asarray(q_device, float)
+        if nominal:                                  # the URDF as core has it: no signs, no offsets
+            return q.copy()
+        a = self.d["arms"][side]
+        q = self.chains[side].device_to_urdf(q).copy()
+        q[1] += a["pitch_roll_coupling"] * q[0]
+        return q + np.array(a["zero_offset_rad"])
+
+    def points(self, side, q_device, nominal=False):
+        """(joint origins (6,3) incl. the wrist pivot, {tag: (3,)}) in the reference frame, m."""
+        c = self.chains[side]
+        q = self.angles(side, q_device, nominal)
+        F = c.frames(q)
+        joints = np.vstack([c.joint_origins(q), F[-1][:3, 3]])
+        a = self.d["arms"][side]
+        tags = {tag: F[i][:3, :3] @ np.array(a["tag_on_link_m"][tag]) + F[i][:3, 3]
+                for tag, i in a["tag_link"].items()}
+        tf = lambda p: self.R @ p + self.t
+        return np.array([tf(p) for p in joints]), {k: tf(v) for k, v in tags.items()}
+
+
+def fit_station(poses, coupling=False):
+    """Try both pitch directions per arm and both roll starts; return the best fit."""
+    import itertools
+    best = None
+    for signs in itertools.product((1.0, -1.0), repeat=2):
+        for seeds in itertools.product((0.0, np.pi), repeat=2):
+            m = StationMap(poses, signs, seeds, coupling)
+            x, J = levenberg_marquardt(m.residuals, m.initial_guess(), iters=250)
+            r = m.residuals(x)
+            rms = float(np.sqrt((r.reshape(-1, 3) ** 2).sum(1).mean()))
+            print(f"  pitch signs {tuple(int(v) for v in signs)}, roll start "
+                  f"{tuple(int(np.degrees(v)) for v in seeds)}: RMS {rms:7.2f} mm")
+            if best is None or rms < best[0]:
+                best = (rms, m, x, J, r)
+    return best
+
+
+def report_station(m, x, r):
+    k = 0
+    for side in SIDES:
+        n = sum(len(obs) for _, obs, _ in m.poses[side])
+        rr = r.reshape(-1, 3)[k:k + n]; k += n
+        labels = [tag for _, obs, _ in m.poses[side] for tag in obs]
+        on, dq, c = m.arm_params(x, side)
+        print(f"\n=== {side} arm: {len(m.poses[side])} still poses, {n} tag observations, "
+              f"pitch sign {int(m.arms[side].chain.frame_sign[0]):+d}")
+        print(f"  residual RMS {np.sqrt((rr ** 2).sum(1).mean()):.2f} mm, "
+              f"max {np.linalg.norm(rr, axis=1).max():.2f} mm")
+        for tag in TAG_LINK:
+            v = np.array([e for e, l in zip(rr, labels) if l == tag])
+            if len(v):
+                print(f"    {tag:14s} n={len(v):3d}  RMS {np.sqrt((v ** 2).sum(1).mean()):6.2f} mm")
+        names = ["pitch (vs left)" if side == "right" else None, "roll", "yaw", "elbow"]
+        offs = [f"{nm} {((np.degrees(dq[j]) + 180) % 360) - 180:+.2f}" for j, nm in enumerate(names) if nm]
+        print("  zero offsets (deg): " + ", ".join(offs) + (f"; coupling c {c:+.4f}" if m.coupling else ""))
+        print("  tags from their joint (mm): " +
+              ", ".join(f"{tag} {np.linalg.norm(p) * 1000:.0f}" for tag, p in on.items()))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("runs", nargs="+")
-    ap.add_argument("--arms", default="left,right")
     ap.add_argument("--still-deg", type=float, default=0.3)
     ap.add_argument("--still-s", type=float, default=1.0)
     ap.add_argument("--min-frames", type=int, default=5)
     ap.add_argument("--outlier-mm", type=float, default=3.0)
-    ap.add_argument("--out", help="write the fit as JSON")
+    ap.add_argument("--coupling", action="store_true", help="also fit pitch-to-roll coupling")
+    ap.add_argument("--out", help="write the fitted map as JSON (for view_map.py)")
     a = ap.parse_args()
 
     t, joints, tags = load_frames(a.runs)
-    results = {}
-    for side in a.arms.split(","):
-        poses = still_poses(side, t, joints, tags, a.still_deg, a.still_s, a.min_frames, a.outlier_mm)
-        if len(poses) < 6:
-            print(f"{side}: only {len(poses)} still poses, not enough to fit")
-            continue
-        model = ArmModel(side)
-        x, J = levenberg_marquardt(lambda x: model.residuals(x, poses), initial_guess(model, poses))
-        results[side] = report(model, x, J, poses)
+    poses = {side: still_poses(side, t, joints, tags, a.still_deg, a.still_s, a.min_frames, a.outlier_mm)
+             for side in SIDES}
+    for side in SIDES:
+        if len(poses[side]) < 6:
+            sys.exit(f"{side}: only {len(poses[side])} still poses, not enough to fit")
+    print("fitting both arms on one base:")
+    rms, m, x, J, r = fit_station(poses, coupling=a.coupling)
+    report_station(m, x, r)
     if a.out:
-        Path(a.out).write_text(json.dumps(results, indent=2) + "\n")
+        d = m.to_json(x, J, r)
+        d["runs"] = a.runs
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.out).write_text(json.dumps(d, indent=2) + "\n")
         print(f"\nwrote {a.out}")
     return 0
 
