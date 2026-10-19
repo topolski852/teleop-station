@@ -1,0 +1,17 @@
+# Daemon build
+daemon/build/
+*.o
+*.a
+*.so
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+.pytest_cache/
+
+# misc
+.DS_Store
