@@ -333,9 +333,10 @@ class LoadedMap:
     def __init__(self, d: dict):
         self.d = d
         self.R, self.t = np.array(d["base"]["R"]), np.array(d["base"]["t_m"])
-        self.chains = {}
+        self.chains, self.core_chains = {}, {}
         for side, a in d["arms"].items():
             c = ArmChain(a["joints"])
+            self.core_chains[side] = ArmChain(a["joints"])     # core's own signs, untouched
             c.frame_sign = np.array(a["frame_sign"])
             self.chains[side] = c
 
@@ -345,8 +346,8 @@ class LoadedMap:
 
     def angles(self, side, q_device, nominal=False):
         q = np.asarray(q_device, float)
-        if nominal:                                  # the URDF as core has it: no signs, no offsets
-            return q.copy()
+        if nominal:                                  # core's kinematics as they stand, no offsets
+            return self.core_chains[side].device_to_urdf(q)
         a = self.d["arms"][side]
         q = self.chains[side].device_to_urdf(q).copy()
         q[1] += a["pitch_roll_coupling"] * q[0]

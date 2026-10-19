@@ -13,9 +13,10 @@ On each frame:
 - **green**: the encoder angles through the fitted map (``fit_map.py --out``): the arm's joint
   chain, and a cross where each tag should be. A line joins it to the yellow circle, labelled
   with the 3D distance between them (mm),
-- **magenta** (N toggles): the same encoder angles through the URDF exactly as core has it,
-  with no direction signs and no zero offsets, on the same base. Where it disagrees with
-  green, core's kinematics and the real arm disagree.
+- **magenta** (N toggles): the same encoder angles through core's kinematics as they stand
+  (core's ``joint_sign``, no fitted zero offsets), on the same base. Where it disagrees with
+  green, core and the real arm disagree. Before core c72dcc3 it swung the shoulder pitch the
+  wrong way; now the two differ only by the zero offsets.
 
 Every frame is logged like ``record_map.py`` (``runs/view_<time>.jsonl``), with the joint
 angles read just before and just after the shot, so a session doubles as mapping data. A
@@ -126,7 +127,7 @@ def main() -> int:
             scale = min(1.0, 1300 / frame.shape[0], 1800 / frame.shape[1])
             show = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             lines = [f"frame {n_frames}   " + ("ARM MOVED DURING SHOT" if moved > a.moving_deg else "still"),
-                     "green = encoders through fitted map", "magenta = encoders through core's URDF (N)",
+                     "green = encoders through fitted map", "magenta = encoders through core, no offsets (N)",
                      "yellow = camera", ""]
             if fit is None:
                 lines.append("reference tags NOT SEEN")
