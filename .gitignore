@@ -21,3 +21,6 @@ targets/
 
 # Camera: per-setup reference layout (scripts/track_tags.py --survey)
 config/layout.json
+
+# Measurement runs (scripts/record_map.py)
+runs/

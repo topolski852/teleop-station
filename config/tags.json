@@ -3,43 +3,43 @@
   "tags": {
     "0": {
       "name": "right_hand",
-      "size_m": 0.037
+      "size_m": 0.0367
     },
     "1": {
       "name": "right_wrist",
-      "size_m": 0.037
+      "size_m": 0.0367
     },
     "2": {
       "name": "right_shoulder_roll",
-      "size_m": 0.037
+      "size_m": 0.0367
     },
     "3": {
       "name": "left_hand",
-      "size_m": 0.037
+      "size_m": 0.0367
     },
     "4": {
       "name": "left_wrist",
-      "size_m": 0.037
+      "size_m": 0.0367
     },
     "5": {
       "name": "left_shoulder_roll",
-      "size_m": 0.037
+      "size_m": 0.0367
     },
     "6": {
       "name": "torso_top",
-      "size_m": 0.037
+      "size_m": 0.0367
     },
     "7": {
       "name": "torso_front",
-      "size_m": 0.037
+      "size_m": 0.0367
     },
     "8": {
       "name": "table_far_left",
-      "size_m": 0.037
+      "size_m": 0.0367
     },
     "9": {
       "name": "table_near_right",
-      "size_m": 0.037
+      "size_m": 0.0367
     }
   },
   "reference": [
@@ -48,5 +48,5 @@
     6,
     7
   ],
-  "note": "Black-square edge measured 37 mm on all tags (2026-10-19, to the nearest mm; refine to 0.1 mm per tag). Reference = the tags that stay still during a test (table 8, 9; torso 6, 7); the first is the anchor."
+  "note": "Black-square edge 36.7 mm on all tags (calipered 2026-10-19). Reference = the tags that stay still during a test (table 8, 9; torso 6, 7); the first is the anchor."
 }

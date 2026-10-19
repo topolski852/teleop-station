@@ -3,3 +3,5 @@ numpy>=1.24
 pydantic>=2.0
 # Camera measurement (teleop_station.vision): AprilTag + ChArUco live in the contrib build.
 opencv-contrib-python>=4.8
+# Tethered still camera (camera.py source "gphoto2"; bundles libgphoto2)
+gphoto2>=2.5

@@ -6,7 +6,13 @@ Live, from a camera (a window opens; move the board through the view):
     python scripts/calibrate_camera.py --source /dev/video0 --square 0.0279 \\
         --width 1920 --height 1080 --out calib/webcam_1080p.json
 
-From a folder of stills (e.g. D5600 shots pulled with gphoto2):
+From a tethered still camera (one shot per view, ~1 s each; keep the board still while it
+fires). ``gphoto2:DIR`` also keeps every shot, so the solve can be redone from the folder:
+
+    python scripts/calibrate_camera.py --source gphoto2:runs/calib_sony --square 0.03405 \\
+        --out calib/a7s3_sigma16_2768x1848.json
+
+From a folder of stills (e.g. shots kept as above, or pulled with gphoto2):
 
     python scripts/calibrate_camera.py --source shots/ --square 0.0279 --out calib/d5600.json
 
@@ -83,6 +89,9 @@ def live(src: str, board, width: int, height: int) -> tuple[list, tuple[int, int
         cv2.putText(tint, f"views {len(views)}/{TARGET_VIEWS}  ENTER solve  Q quit  "
                     f"(blue = covered; fill the corners too)", (15, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        scale = min(1.0, 1300 / tint.shape[0], 2200 / tint.shape[1])
+        if scale < 1.0:
+            tint = cv2.resize(tint, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         cv2.imshow("calibrate", tint)
         if key in (13, 10) or len(views) >= TARGET_VIEWS:
             break

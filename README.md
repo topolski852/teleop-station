@@ -59,6 +59,20 @@ table. Tags 6-9 are the reference.
    noise floor of a stop's averaged reading is lower. `--measure N` prints one N-frame reading
    as JSON.
 
+**The measurement camera is the Sony a7S III**, tethered over USB (`--source gphoto2`, PC
+Remote mode, one still per frame, about 2 s each with detection). Body settings: M mode, MF,
+f/5.6, **1/60 s with the mechanical shutter** and anti-flicker on, ISO 3200, a fixed white
+balance, SteadyShot off, and PC Remote's save size on Original. Under 60 Hz lighting, 1/100 s
+or the electronic shutter put flicker bands across each still and tripled the noise. With the
+Sigma 16 mm f/1.4 DC DN (APS-C crop, 2768x1848) it calibrated at 0.27 px RMS, its tag
+distances agree with a tape measure to a few mm, and a 10-shot reading of a still tag repeats
+to 0.03-0.15 mm.
+
+`scripts/record_map.py` records the camera-to-encoder map while the arms are moved by hand
+(joints limp in IDLE, angles read from humanoid-web's cached telemetry, nothing commanded).
+`scripts/fit_map.py` fits each arm's kinematics to it (with the Sony, pass `--min-frames 2
+--still-s 4`).
+
 The Logitech C310 (1280x960) calibrated at 0.28 px RMS. With exposure locked, a 30-frame
 reading of a still arm tag repeats to 0.12-0.19 mm, with 0.1-0.6 mm of drift over 2 minutes
 (possibly the webcam warming up). Its field of view only just covers the shoulders, so arm
