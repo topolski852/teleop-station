@@ -1,0 +1,52 @@
+{
+  "family": "25h9",
+  "tags": {
+    "0": {
+      "name": "right_hand",
+      "size_m": 0.037
+    },
+    "1": {
+      "name": "right_wrist",
+      "size_m": 0.037
+    },
+    "2": {
+      "name": "right_shoulder_roll",
+      "size_m": 0.037
+    },
+    "3": {
+      "name": "left_hand",
+      "size_m": 0.037
+    },
+    "4": {
+      "name": "left_wrist",
+      "size_m": 0.037
+    },
+    "5": {
+      "name": "left_shoulder_roll",
+      "size_m": 0.037
+    },
+    "6": {
+      "name": "torso_top",
+      "size_m": 0.037
+    },
+    "7": {
+      "name": "torso_front",
+      "size_m": 0.037
+    },
+    "8": {
+      "name": "table_far_left",
+      "size_m": 0.037
+    },
+    "9": {
+      "name": "table_near_right",
+      "size_m": 0.037
+    }
+  },
+  "reference": [
+    8,
+    9,
+    6,
+    7
+  ],
+  "note": "Black-square edge measured 37 mm on all tags (2026-10-19, to the nearest mm; refine to 0.1 mm per tag). Reference = the tags that stay still during a test (table 8, 9; torso 6, 7); the first is the anchor."
+}

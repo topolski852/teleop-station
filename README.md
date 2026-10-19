@@ -18,8 +18,8 @@ runs from [`humanoid-control`](https://github.com/topolski852/humanoid-control) 
   profiles). `humanoid_core` at the repo root is a symlink into it.
 - `teleop_station/`: what only the station needs.
   - `vision/`: the camera as a measuring instrument for the accuracy test (roadmap 2).
-    AprilTag 36h11 poses, with the wrist tags reported in the frame of a base tag fixed to
-    the station, and averaging over the frames at each stop.
+    AprilTag poses, with every tag reported in a reference frame fitted to the tags that
+    stay still during a test (table and torso), and averaging over the frames at each stop.
 - `scripts/`: `make_targets.py` (print sheets: tags and the ChArUco board),
   `calibrate_camera.py` (camera intrinsics), `track_tags.py` (live wrist positions and the
   camera's noise floor).
@@ -35,20 +35,34 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ### Setting up the camera
 
-Nothing here moves an arm.
+Nothing here moves an arm. The tag set (family, ids, names, sizes, which tags are the
+reference) is in `config/tags.json`: 25h9 tags, ids 0-2 on the right arm (hand, wrist
+actuator, shoulder_roll), 3-5 on the left arm, 6-7 on the torso (top, front), 8-9 on the
+table. Tags 6-9 are the reference.
 
-1. `python scripts/make_targets.py`, then print `targets/tags.png` and `targets/charuco.png`
-   at 100% on matte paper and mount them flat. Check the 100 mm bar, then measure each tag's
-   black square and one board square with calipers. Use those numbers from here on.
-2. Fix the camera and lock it: manual focus, fixed zoom, manual exposure. On a webcam
-   the scripts ask the driver to lock these (check what `camera:` reports); through an HDMI
-   capture card, set them on the camera body.
+1. `python scripts/make_targets.py`, then print `targets/charuco.pdf` (and `targets/tags.pdf`
+   for spare tags) at **100% / actual size** on matte paper, and mount it flat and rigid.
+   Check the 100 mm bar. If the printer scaled the page, the board still works, but measure
+   it: span 4-5 squares with calipers in both directions and divide. Measure each tag's
+   **black square** (not the cut-out paper) and put it in `config/tags.json`.
+2. Fix the camera and lock it: manual focus, fixed zoom, manual exposure. On a webcam,
+   pass `--exposure` (the live view's `[` and `]` keys find a value; auto exposure clips the
+   white and breaks decoding). Through an HDMI capture card, set them on the camera body.
 3. `python scripts/calibrate_camera.py --source /dev/video0 --square <m> --width W --height H
    --out calib/<camera>.json`. Aim for RMS under 0.5 px. Redo it if focus or zoom ever moves.
-4. Glue tag 0 to the station base, flat, where it stays in view for every pose, and a wrist tag
-   on each wrist. `python scripts/track_tags.py --source /dev/video0 --calib calib/<camera>.json
-   --size 0=<m> --size 1=<m> --size 2=<m>`. With nothing moving, the `±` spread is the
-   noise floor, the finest repeatability this setup can measure.
+4. Once the table and torso are where they'll stay, survey the reference tags:
+   `python scripts/track_tags.py --source /dev/video0 --calib calib/<camera>.json
+   --exposure <n> --survey 90` (writes `config/layout.json`, not committed). Redo it whenever
+   either one has moved.
+5. `python scripts/track_tags.py --source /dev/video0 --calib calib/<camera>.json --exposure <n>`
+   shows every tag live. With nothing moving, the `±` spread is the single-frame noise; the
+   noise floor of a stop's averaged reading is lower. `--measure N` prints one N-frame reading
+   as JSON.
+
+The Logitech C310 (1280x960) calibrated at 0.28 px RMS. With exposure locked, a 30-frame
+reading of a still arm tag repeats to 0.12-0.19 mm, with 0.1-0.6 mm of drift over 2 minutes
+(possibly the webcam warming up). Its field of view only just covers the shoulders, so arm
+poses that reach outward leave the frame.
 
 A fix to the daemon or the arm math goes into humanoid-core, not here. Then move the `core/`
 pointer forward in this repo (see core's README).

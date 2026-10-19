@@ -6,8 +6,9 @@ three before calibrating (manual focus, no zoom change, fixed capture mode) and 
 if any of them moves. The file records the image size, and loading it against a different
 frame size fails rather than silently measuring wrong.
 
-The board uses a 5x5 ArUco dictionary, not the 36h11 family the station tags use, so the
-board's markers can never be mistaken for a wrist or base tag that happens to be in view.
+The board uses the 5x5 ArUco dictionary. Its markers (ids 0-16) differ from the station's
+25h9 tags 0-9 by at least 5 bits in every rotation, more than the detector corrects, so a
+board in view is never read as a station tag.
 """
 from __future__ import annotations
 
@@ -55,6 +56,17 @@ class CameraCalibration:
             "image_size": list(self.image_size), "rms_px": self.rms_px,
             "n_views": self.n_views, "note": self.note,
         }, indent=2) + "\n")
+
+    @classmethod
+    def guess(cls, width: int, height: int, hfov_deg: float) -> "CameraCalibration":
+        """A rough pinhole from the lens's horizontal field of view, no distortion.
+
+        Enough to see tags tracking and judge placement before a real calibration. Distances
+        are off by a few percent; don't measure with it.
+        """
+        f = width / 2 / np.tan(np.radians(hfov_deg) / 2)
+        K = np.array([[f, 0, (width - 1) / 2], [0, f, (height - 1) / 2], [0, 0, 1]])
+        return cls(K, np.zeros(5), (width, height), float("nan"), 0, f"guess: hfov {hfov_deg} deg")
 
     @classmethod
     def load(cls, path: str | Path) -> "CameraCalibration":
