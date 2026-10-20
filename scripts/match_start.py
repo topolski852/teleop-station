@@ -34,6 +34,17 @@ def main() -> int:
     plan = PlannedPath.load(a.path)
     start = plan.lead_in[0].q[0] if plan.lead_in else plan.stops[0]
     bus = DaemonBus(a.config)
+    s = bus.read(plan.names)
+    stiff = {n.replace("_joint", ""): x.state for n, x in s.items() if x.state != "IDLE"}
+    if stiff:
+        # After an E-stop the joints are DAMPING: they resist being moved by hand.
+        print("joints not limp:", stiff)
+        if input("Switch every joint to IDLE (limp) so you can move the arm by hand? "
+                 "Arms resting on the table or supported? [y/N] ").strip().lower() == "y":
+            bus.wake()
+            time.sleep(0.5)
+        else:
+            print("left as they are")
     done = threading.Event()
     threading.Thread(target=lambda: (sys.stdin.readline(), done.set()), daemon=True).start()
     print(f"Move the arm to the path's start; every joint within {a.tol:.0f} deg = OK. Enter when done.\n")
