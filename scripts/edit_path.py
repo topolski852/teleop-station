@@ -3,6 +3,7 @@
 
     python scripts/edit_path.py runs/path_raw_demo.json            # -> runs/path_raw_demo.planned.json
     python scripts/edit_path.py runs/path_raw_demo.json --smooth 0.4 --vmax 10
+    python scripts/edit_path.py runs/path_raw_demo.json --combine   # arms recorded one after the other
 
 Finds the pauses (the stops), smooths each stretch between them, re-times it with a
 minimum-jerk profile under the speed and acceleration caps, and checks it (limits, speed,
@@ -34,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from teleop_station.motion import JointLimits, RawPath, plan_path   # noqa: E402
+from teleop_station.motion import JointLimits, RawPath, combine_arms, plan_path   # noqa: E402
 
 DEG = np.pi / 180
 DAEMON_CONFIG = "/home/nse/humanoid-studio/configs/humanoid_arms.json"
@@ -46,17 +47,31 @@ def joint_plot(raw, plan, limits, path):
     W, H, cols, rows = 1800, 1250, 2, len(names) // 2
     img = np.full((H, W, 3), 30, np.uint8)
     pw, ph = W // cols, H // rows
-    spans = plan.params["stop_spans_s"]
-    t_end = raw.t[-1] + (plan.segments[-1].duration if plan.closes_loop or len(plan.segments) > len(spans) - 1 else 0)
-    # planned samples mapped onto the recording's time: segment k fills the gap between stop k and k+1
-    pt, pq = [], []
-    for k, seg in enumerate(plan.segments):
-        if k + 1 < len(spans):
-            a, b = spans[k][1], spans[k + 1][0]
-        else:                                           # the closing move, after the recording
-            a, b = raw.t[-1], t_end
-        pt.append(a + seg.t / max(seg.t[-1], 1e-9) * (b - a)); pq.append(seg.q)
-    pt, pq = np.concatenate(pt), np.vstack(pq)
+    if "stop_spans_s" in plan.params:
+        spans = plan.params["stop_spans_s"]
+        t_end = raw.t[-1] + (plan.segments[-1].duration if len(plan.segments) > len(spans) - 1 else 0)
+        # planned samples mapped onto the recording's time: segment k fills the gap between stops
+        pt, pq = [], []
+        for k, seg in enumerate(plan.segments):
+            if k + 1 < len(spans):
+                a, b = spans[k][1], spans[k + 1][0]
+            else:                                       # the closing move, after the recording
+                a, b = raw.t[-1], t_end
+            pt.append(a + seg.t / max(seg.t[-1], 1e-9) * (b - a)); pq.append(seg.q)
+        pt, pq = np.concatenate(pt), np.vstack(pq)
+        raw_t = raw.t
+    else:
+        # Combined arms: the plan runs both at once, so it has its own timeline. Draw recording
+        # and plan each across the full width (shapes compare; times don't line up).
+        spans = []
+        program = plan.lead_in + plan.segments + plan.lead_out
+        pt, pq, t0 = [], [], 0.0
+        for seg in program:
+            pt.append(t0 + seg.t); pq.append(seg.q); t0 += seg.duration
+        pt, pq = np.concatenate(pt), np.vstack(pq)
+        t_end = raw.t[-1]
+        pt = pt / pt[-1] * t_end
+        raw_t = raw.t
     for j, n in enumerate(names):
         c, r = (0 if n.startswith("left") else 1), j % rows
         x0, y0 = c * pw + 70, r * ph + 30
@@ -72,7 +87,7 @@ def joint_plot(raw, plan, limits, path):
             yy = int(Y(np.array(lim)))
             for xx in range(x0, x0 + w, 12):
                 cv2.line(img, (xx, yy), (xx + 6, yy), (60, 60, 200), 1)
-        cv2.polylines(img, [np.c_[X(raw.t), Y(raw.q[:, j])].astype(np.int32)], False, GREY, 1, cv2.LINE_AA)
+        cv2.polylines(img, [np.c_[X(raw_t), Y(raw.q[:, j])].astype(np.int32)], False, GREY, 1, cv2.LINE_AA)
         cv2.polylines(img, [np.c_[X(pt), Y(pq[:, j])].astype(np.int32)], False, GREEN, 2, cv2.LINE_AA)
         cv2.putText(img, f"{n.replace('_joint', '')}  {lo:.0f}..{hi:.0f} deg", (x0 + 6, y0 + 18),
                     cv2.FONT_HERSHEY_PLAIN, 1.2, WHITE, 1, cv2.LINE_AA)
@@ -115,11 +130,17 @@ def preview_video(raw, plan, background, path, fps=25, hold_s=0.8):
             cv2.putText(base, f"S{k + 1}", (int(uv[0]) + 8, int(uv[1]) - 8), cv2.FONT_HERSHEY_PLAIN, 1.4, YELLOW, 2)
     vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (base.shape[1], base.shape[0]))
     frames = []
-    for k, seg in enumerate(plan.segments):
-        frames += [(seg.q[0], f"stop S{k + 1}")] * int(hold_s * fps)
+    def play(seg, label):
         for tt in np.arange(0, seg.duration, 1 / fps):
             j = min(len(seg.t) - 1, int(np.searchsorted(seg.t, tt)))
-            frames.append((seg.q[j], f"segment {k + 1}  t {tt:4.1f}/{seg.duration:.1f} s"))
+            frames.append((seg.q[j], f"{label}  t {tt:4.1f}/{seg.duration:.1f} s"))
+    for seg in plan.lead_in:
+        play(seg, "lead-in from rest")
+    for k, seg in enumerate(plan.segments):
+        frames += [(seg.q[0], f"stop S{k + 1}")] * int(hold_s * fps)
+        play(seg, f"move {k + 1}")
+    for seg in plan.lead_out:
+        play(seg, "lead-out to rest")
     for q, label in frames:
         f = base.copy()
         for side, ix in idx.items():
@@ -144,18 +165,25 @@ def main() -> int:
     ap.add_argument("--still-deg", type=float, default=0.5)
     ap.add_argument("--max-deviation", type=float, default=2.0, help="deg the plan may stray from the recording")
     ap.add_argument("--limits", default="soft", choices=("soft", "hard"))
+    ap.add_argument("--combine", action="store_true",
+                    help="arms recorded one after the other: plan each, run them together")
+    ap.add_argument("--via-speed", type=float, default=8.0, help="split strokes where the hand slowed below this, deg/s")
     ap.add_argument("--background", help="Sony shot of the station for the preview video")
     ap.add_argument("--no-video", action="store_true")
     a = ap.parse_args()
 
     raw = RawPath.load(a.raw)
     limits = JointLimits.for_arms(DAEMON_CONFIG, tier=a.limits)
-    plan = plan_path(raw, limits, a.vmax * DEG, a.amax * DEG, still_deg=a.still_deg, dwell_s=a.pause_s,
-                     smooth_s=a.smooth, max_deviation_deg=a.max_deviation)
+    kw = dict(still_deg=a.still_deg, dwell_s=a.pause_s, smooth_s=a.smooth, max_deviation_deg=a.max_deviation,
+              via_speed_deg=a.via_speed)
+    plan = (combine_arms(raw, limits, a.vmax * DEG, a.amax * DEG, **kw) if a.combine
+            else plan_path(raw, limits, a.vmax * DEG, a.amax * DEG, **kw))
     plan.params["limits"] = a.limits
     out = Path(a.out or str(Path(a.raw).with_suffix("")) + ".planned.json")
     print(f"{a.raw}: {raw.t[-1]:.0f} s recorded -> {len(plan.stops)} stops, {len(plan.segments)} moves, "
-          f"{plan.duration:.0f} s of motion per cycle at {a.vmax:.0f} deg/s")
+          f"{plan.duration:.0f} s of motion per cycle at {a.vmax:.0f} deg/s"
+          + (f"; arms combined (stops per arm {plan.params.get('stops_per_arm')}), lead-in/out "
+             f"{plan.lead_in[0].duration:.0f} s each" if plan.lead_in else ""))
     for k, seg in enumerate(plan.segments):
         dev = plan.deviation_deg[k]
         frm, to = k + 1, (k + 1) % len(plan.stops) + 1

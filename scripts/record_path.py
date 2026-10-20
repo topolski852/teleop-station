@@ -13,6 +13,13 @@ you've been still long enough to count, so you never need a free hand during the
 - Keep the arm you're not moving resting on the table, and set an arm down before letting go:
   a limp arm falls, and a fall would be recorded and replayed.
 - Enter starts the recording, Enter (or Ctrl-C) ends it.
+- The status line shows PAST LIMIT when a joint is beyond where the motors are allowed to drive
+  it (``--limits``, the ESC tier by default). A limp arm has no mechanical stops, so the hand
+  can take it there, but a replay can't; stay inside. The limits only mean anything once the
+  arms are zeroed (the zero is lost at every power-up).
+- Pause briefly at every turn and reversal too, not just where you want to measure: the
+  planner splits the path at near-stops, and a fast wiggle with no pause can't be smoothed
+  without straying from where the hand went.
 
 If the joints are asleep (as after a power-up) it asks before waking them to IDLE: a mode
 change, not a motion. Joints already ENABLED belong to someone else's command; it refuses.
@@ -31,7 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from humanoid_core.layout import LIMB_JOINTS                    # noqa: E402
-from teleop_station.motion import DaemonBus, RawPath            # noqa: E402
+from teleop_station.motion import DaemonBus, JointLimits, RawPath   # noqa: E402
 from teleop_station.motion.bus import LIVE                       # noqa: E402
 
 DAEMON_CONFIG = "/home/nse/humanoid-studio/configs/humanoid_arms.json"
@@ -43,10 +50,14 @@ def main() -> int:
     ap.add_argument("--hz", type=float, default=50.0)
     ap.add_argument("--pause-s", type=float, default=1.5, help="still this long = a stop")
     ap.add_argument("--still-deg", type=float, default=0.5, help="every joint within this = still")
+    ap.add_argument("--limits", default="hard", choices=("soft", "hard"),
+                    help="warn when a joint leaves this range: the motors won't follow it there")
     ap.add_argument("--config", default=DAEMON_CONFIG)
     a = ap.parse_args()
 
     names = list(LIMB_JOINTS["left_arm"]) + list(LIMB_JOINTS["right_arm"])
+    limits = JointLimits.for_arms(a.config, tier=a.limits)
+    lo = np.array([limits.lower[n] for n in names]); hi = np.array([limits.upper[n] for n in names])
     bus = DaemonBus(a.config)
     try:
         s = bus.read(names)
@@ -76,6 +87,7 @@ def main() -> int:
         t, q = [], []
         t0 = time.monotonic()
         pauses, in_pause, last_show = 0, False, 0.0
+        over: set[str] = set()
         n_win = int(a.pause_s * a.hz)
         try:
             while not done.is_set():
@@ -92,9 +104,13 @@ def main() -> int:
                     if still and not in_pause:
                         pauses += 1
                     in_pause = still
-                if tick - last_show > 0.5:
+                out = [names[j].replace("_joint", "") for j in np.where((np.array(q[-1]) < lo) | (np.array(q[-1]) > hi))[0]]
+                if out:
+                    over.update(out)
+                if tick - last_show > 0.3:
+                    warn = f"  PAST LIMIT: {', '.join(out)}" if out else ""
                     print(f"\r  {t[-1]:6.1f} s  {'PAUSE (counts as a stop)' if in_pause else 'moving                 '}"
-                          f"  stops so far: {pauses}   ", end="", flush=True)
+                          f"  stops so far: {pauses}{warn}".ljust(150), end="", flush=True)
                     last_show = tick
                 time.sleep(max(0.0, 1.0 / a.hz - (time.monotonic() - tick)))
         except KeyboardInterrupt:
@@ -109,6 +125,9 @@ def main() -> int:
     raw.save(a.out)
     print(f"wrote {a.out}: {t[-1]:.0f} s, {len(t)} samples, ~{pauses} pauses. "
           f"Next: python scripts/edit_path.py {a.out}")
+    if over:
+        print(f"WARNING: went past the {a.limits} limits on {sorted(over)}: the motors won't follow there, "
+              f"so that part can't be replayed. Re-record staying inside.")
     return 0
 
 

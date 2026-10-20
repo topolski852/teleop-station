@@ -153,7 +153,14 @@ def build_path_program(path_file, arms, vmax, amax, limits):
     problems = [p for p in plan.problems if not p.startswith("NOTE")]
     for k, seg in enumerate(segs):
         problems.extend(f"segment {k + 1}: {p}" for p in limits.check(seg, vmax, amax))
-    return names, stops[0], list(zip(labels, stops)), steps, problems, plan
+    # Combined paths start and end at rest via a lead-in/lead-out; plain ones at their first stop.
+    lead_in = [Trajectory(names, s.t, s.q[:, keep]) for s in plan.lead_in]
+    lead_out = [Trajectory(names, s.t, s.q[:, keep]) for s in plan.lead_out]
+    for label, trs in (("lead-in", lead_in), ("lead-out", lead_out)):
+        for tr in trs:
+            problems.extend(f"{label}: {p}" for p in limits.check(tr, vmax, amax))
+    rest = np.asarray(plan.rest)[keep] if plan.rest is not None else stops[0]
+    return names, rest, list(zip(labels, stops)), steps, problems, plan, lead_in, lead_out
 
 
 def main() -> int:
@@ -188,6 +195,7 @@ def main() -> int:
     vmax, amax, final_vmax, approach = a.vmax * DEG, a.amax * DEG, a.final_vmax * DEG, a.approach * DEG
     per_stop = 2.0 + a.settle + (0 if a.no_camera else a.shots * 2.1)
 
+    lead_in, lead_out = [], []
     if a.poses:
         poses = json.loads(Path(a.poses).read_text())
         if not poses.get("rest"):
@@ -205,8 +213,13 @@ def main() -> int:
             print(f"  {label:8s} " + "  ".join(f"{n.replace('_joint', '').replace('shoulder_', 'sh_')} {v / DEG:+6.1f}"
                                              f"{'+' if dd > 0 else '-'}" for n, v, dd in zip(names, target, d)))
     else:
-        names, rest, stops, steps, problems, plan = build_path_program(a.path, arms, vmax, amax, limits)
-        first_move = lambda q0: movej(names, q0, rest, vmax, amax)
+        names, rest, stops, steps, problems, plan, lead_in, lead_out = build_path_program(
+            a.path, arms, vmax, amax, limits)
+        def first_move(q0):
+            tr = movej(names, q0, lead_in[0].q[0] if lead_in else rest, vmax, amax)
+            for seg in lead_in:
+                tr = tr + seg
+            return tr
         first_measure = None
         steps_first = steps
         print(f"program: taught path {a.path}: {len(stops)} stops, {len(steps)} moves per cycle, arms {arms}"
@@ -297,6 +310,10 @@ def main() -> int:
             for tr, label, target in (steps_first if c == 0 else steps):
                 ex.run(tr, vmax, amax)
                 measure(c, label, target, ex.settle())
+        if a.path and lead_out and np.abs(ex.last_target - lead_out[0].q[0]).max() < 1e-6:
+            for seg in lead_out:                       # back to rest along the recorded path
+                ex.run(seg, vmax, amax)
+            ex.settle()
         if np.abs(ex.last_target - rest).max() > 1e-6:
             ex.run(movej(names, ex.last_target, rest, vmax, amax), vmax, amax)
             ex.settle()
