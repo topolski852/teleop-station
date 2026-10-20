@@ -40,6 +40,34 @@ from teleop_station.motion import (DaemonBus, Executor, JointLimits, MotionAbort
 DEG = np.pi / 180
 
 
+def survey_only(a, arms, stamp) -> int:
+    import glob
+    import cv2
+    from teleop_station.vision import CameraCalibration, TagSet, TagTracker, save_body_layout, survey_body
+    calib = CameraCalibration.load(a.calib)
+    tags = TagSet.load(ROOT / "config" / "tags.json")
+    tr = TagTracker(calib, replace(tags, body_layout={}))
+    sightings = []
+    for d in a.also:
+        files = sorted(glob.glob(f"{d}/*.jpg"))
+        sightings += [tr.detect(cv2.imread(f)) for f in files]
+        print(f"{len(files)} shots from {d}")
+    layout, info = {}, {}
+    for body, ids in tags.bodies.items():
+        if len(ids) < 2 or not any(body.startswith(s) for s in arms):
+            continue
+        lay, inf = survey_body(ids, sightings, min_pairs=2, max_view_deg=a.max_view)
+        ok = lambda s, i: i in s and s[i].view_deg <= a.max_view
+        pairs = {f"{x}-{y}": sum(ok(s, x) and ok(s, y) for s in sightings) for i, x in enumerate(ids) for y in ids[i + 1:]}
+        missing = [i for i in ids[1:] if i not in lay]
+        layout[body] = lay
+        info[body] = {"reached": {str(k): v for k, v in inf.items()}, "pairs_seen": pairs, "missing": missing}
+        print(f"{body}: placed {sorted(lay)}" + (f", NOT placed {missing}" if missing else "") + f"; usable pairs {pairs}")
+    save_body_layout(a.out_layout, layout, {"surveyed": stamp, "source": "spin_survey --only-survey", "folders": a.also, **info})
+    print(f"wrote {a.out_layout}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--path", help="planned path with a lead-in (edit_path.py --mirror/--combine)")
@@ -56,12 +84,18 @@ def main() -> int:
     ap.add_argument("--camera", default=None, help="camera source (default gphoto2, keeping the shots)")
     ap.add_argument("--calib", default=str(ROOT / "calib" / "a7s3_sigma16_2768x1848.json"))
     ap.add_argument("--out-layout", default=str(ROOT / "config" / "body_layout.json"))
+    ap.add_argument("--also", action="append", default=[], metavar="DIR",
+                    help="also use the shots in this folder (an earlier survey), e.g. from another arm pose")
+    ap.add_argument("--max-view", type=float, default=65.0, help="skip tags seen more edge-on than this, deg")
+    ap.add_argument("--only-survey", action="store_true", help="don't move: just survey the --also folders")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--config", default=DAEMON_CONFIG)
     a = ap.parse_args()
 
     stamp = time.strftime("%Y%m%dT%H%M%S")
     arms = ["left", "right"] if a.arms == "both" else [a.arms]
+    if a.only_survey:
+        return survey_only(a, arms, stamp)
     limits = JointLimits.for_arms(a.config, arms=[f"{s}_arm" for s in arms], tier=a.limits)
     vmax, amax = a.vmax * DEG, a.amax * DEG
     if a.at_rest:
@@ -182,6 +216,16 @@ def main() -> int:
             cam.release()
         bus.close()
         print(f"run ended: {status}")
+    if a.also:
+        import glob
+        import cv2
+        from teleop_station.vision import CameraCalibration, TagSet, TagTracker
+        calib = CameraCalibration.load(a.calib)
+        tr_old = TagTracker(calib, replace(TagSet.load(ROOT / "config" / "tags.json"), body_layout={}))
+        for d in a.also:
+            files = sorted(glob.glob(f"{d}/*.jpg"))
+            sightings += [tr_old.detect(cv2.imread(f)) for f in files]
+            print(f"also {len(files)} shots from {d}")
     if not sightings:
         return 0 if status == "ok" else 1
 
@@ -191,11 +235,14 @@ def main() -> int:
     for body, ids in tags.bodies.items():
         if len(ids) < 2 or not any(body.startswith(s) for s in arms):
             continue
-        lay, inf = survey_body(ids, sightings, min_pairs=2)
+        lay, inf = survey_body(ids, sightings, min_pairs=2, max_view_deg=a.max_view)
+        oblique = sum(1 for s in sightings for i in ids if i in s and s[i].view_deg > a.max_view)
         layout[body] = lay
-        pairs = {f"{x}-{y}": sum(x in s and y in s for s in sightings) for i, x in enumerate(ids) for y in ids[i + 1:]}
+        ok = lambda s, i: i in s and s[i].view_deg <= a.max_view
+        pairs = {f"{x}-{y}": sum(ok(s, x) and ok(s, y) for s in sightings) for i, x in enumerate(ids) for y in ids[i + 1:]}
         info[body] = {"reached": {str(k): v for k, v in inf.items()}, "pairs_seen": pairs,
                       "missing": [i for i in ids[1:] if i not in lay]}
+        print(f"{body}: {oblique} sightings skipped as more than {a.max_view:.0f} deg off face-on")
         print(f"{body}: anchor {ids[0]}, placed {sorted(lay)}" +
               (f", NOT placed {info[body]['missing']}" if info[body]["missing"] else "") +
               f"; pairs seen together {pairs}")

@@ -159,6 +159,12 @@ class Sighting:
     corners: np.ndarray      # 4x2
     side_px: float
 
+    @property
+    def view_deg(self) -> float:
+        """How far off face-on the camera sees this tag (0 = straight at it, 90 = edge-on)."""
+        ray = self.pose.t / np.linalg.norm(self.pose.t)
+        return float(np.degrees(np.arccos(min(1.0, abs(float(self.pose.R[:, 2] @ ray))))))
+
 
 @dataclass
 class ReferenceFit:
@@ -300,7 +306,7 @@ def survey(tags: TagSet, sightings: list[dict[int, Sighting]], outlier_m: float 
 
 
 def survey_body(ids, sightings: list[dict[int, Sighting]], outlier_m: float = 0.005,
-                min_pairs: int = 3) -> tuple[dict[int, Pose], dict]:
+                min_pairs: int = 3, max_view_deg: float = 65.0) -> tuple[dict[int, Pose], dict]:
     """Each tag of a rigid body in its anchor's (``ids[0]``) frame, from frames where tags of
     the body are seen together.
 
@@ -309,11 +315,15 @@ def survey_body(ids, sightings: list[dict[int, Sighting]], outlier_m: float = 0.
     (averaged, outliers dropped as in ``survey``); the layout is then built outward from the
     anchor along the best-observed pairs. Returns (layout, info) where info says, per tag, how
     it was reached and from how many frames.
+
+    A tag seen more than ``max_view_deg`` off face-on is left out: its own pose gets unreliable
+    as it turns edge-on (a cube's end face seen at 70 deg put the left cube 5 mm too wide on
+    2026-10-20, where the right cube's at 63 deg was fine).
     """
     anchor = ids[0]
     rel: dict[tuple[int, int], list[Pose]] = {}
     for s in sightings:
-        vis = [i for i in ids if i in s]
+        vis = [i for i in ids if i in s and s[i].view_deg <= max_view_deg]
         for a in vis:
             for b in vis:
                 if a != b:

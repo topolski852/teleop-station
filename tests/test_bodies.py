@@ -3,7 +3,7 @@
 
     python tests/test_bodies.py
 
-A 50 mm cube with a tag on five faces is rendered through a known pinhole camera in 45 random
+A 50 mm cube with a tag on five faces is rendered through a known pinhole camera in 70 random
 orientations; about half show only one face, the rest two or three. The survey must recover where every face's tag
 sits in the anchor face's frame, including the face opposite the anchor, which never appears
 with it; then the body fit must put the cube where it was, from whichever faces are visible.
@@ -73,7 +73,7 @@ def main() -> int:
 
     print("\n── surveying a 5-face cube from views of 2-3 faces ──────────────")
     sightings, truths = [], []
-    for k in range(45):
+    for k in range(70):
         R = V.rot(*RNG.uniform(-np.pi, np.pi, 3))
         cam_from_cube = Pose(R, np.array([*RNG.uniform(-0.05, 0.05, 2), RNG.uniform(0.32, 0.42)]))
         scene, vis = render(cam_from_cube)
