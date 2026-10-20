@@ -173,6 +173,9 @@ def main() -> int:
     src.add_argument("--poses", help="taught poses (teach_poses.py)")
     src.add_argument("--path", help="taught and planned path (record_path.py, then edit_path.py)")
     ap.add_argument("--cycles", type=int, default=50)
+    ap.add_argument("--minutes", type=float, default=None,
+                    help="run cycles until this much time has passed (finishes the cycle in progress); "
+                         "overrides --cycles")
     ap.add_argument("--arms", default="both", choices=("both", "left", "right"))
     ap.add_argument("--vmax", type=float, default=15.0, help="deg/s per joint (a path keeps its own timing)")
     ap.add_argument("--amax", type=float, default=60.0, help="deg/s^2 per joint")
@@ -254,12 +257,13 @@ def main() -> int:
         cycles = 1
         log("DRY RUN: simulated arm, nothing is sent to the daemon")
     else:
-        print(f"\nThis will ENABLE and MOVE the {' and '.join(arms)} arm(s) for {a.cycles} cycles.")
+        how_long = f"{a.minutes:g} minutes" if a.minutes is not None else f"{a.cycles} cycles"
+        print(f"\nThis will ENABLE and MOVE the {' and '.join(arms)} arm(s) for {how_long}.")
         if input("Are the arms and the space around them clear? Type 'yes' to start: ").strip() != "yes":
             print("not started")
             return 1
         bus = DaemonBus(a.config)
-        cycles = a.cycles
+        cycles = a.cycles if a.minutes is None else 10 ** 6
 
     out.write(json.dumps({"kind": "header", "started": stamp, "dry_run": a.dry_run, "args": vars(a),
                           "mode": "poses" if a.poses else "path", "names": names, "rest": rest.tolist(),
@@ -319,7 +323,8 @@ def main() -> int:
         out.write(json.dumps(rec) + "\n"); out.flush()
         err = np.degrees(E.mean(0) - target)
         tags = "" if not cam_r else f", {len(cam_r['tags'])} tags"
-        print(f"  cycle {cycle_i + 1}/{cycles} {label:8s} settled {settle['settled']} in {settle['t']:.1f} s, "
+        total = "?" if cycles >= 10 ** 6 else cycles
+        print(f"  cycle {cycle_i + 1}/{total} {label:8s} settled {settle['settled']} in {settle['t']:.1f} s, "
               f"encoder - command max {np.abs(err).max():.2f} deg{tags}", flush=True)
 
     status = "ok"
@@ -332,7 +337,11 @@ def main() -> int:
         ex.run(first_move(q0), vmax, amax)
         if first_measure:
             measure(0, *first_measure, ex.settle())
+        t_start = time.time()
         for c in range(cycles):
+            if a.minutes is not None and c > 0 and time.time() - t_start >= a.minutes * 60:
+                log(f"time's up after {c} cycles ({(time.time() - t_start) / 60:.1f} min)")
+                break
             for tr, label, target in (steps_first if c == 0 else steps):
                 ex.run(tr, vmax, amax)
                 measure(c, label, target, ex.settle())
