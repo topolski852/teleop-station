@@ -266,7 +266,14 @@ def main() -> int:
                           "stops": [{"label": l, "target": t.tolist()} for l, t in stops],
                           "limits": {n: [limits.lower[n], limits.upper[n]] for n in names},
                           "camera_layout": cam.layout_json if cam else None}) + "\n")
-    ex = Executor(bus, names, limits, log=log)
+    ticks = {"n": 0}
+    def on_tick(t, cmd, meas):
+        # Tracking, 10 times a second: how far each joint trails its command through the moves.
+        ticks["n"] += 1
+        if ticks["n"] % 5 == 0:
+            out.write(json.dumps({"kind": "track", "t": round(time.time(), 3),
+                                  "cmd": np.round(cmd, 5).tolist(), "meas": np.round(meas, 5).tolist()}) + "\n")
+    ex = Executor(bus, names, limits, log=log, on_tick=on_tick)
 
     presses = {"n": 0}
     def on_sigint(signum, frame):
@@ -343,6 +350,8 @@ def main() -> int:
         status = f"crashed: {e}"
         raise
     finally:
+        log("largest tracking error per joint (deg): " + ", ".join(
+            f"{n.replace('_joint', '')} {np.degrees(v):.1f}" for n, v in zip(names, ex.max_track)))
         log(f"run ended: {status}")
         out.close()
         if cam:

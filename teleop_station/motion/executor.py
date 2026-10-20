@@ -6,8 +6,11 @@ the daemon runs, whoever sent it and whether or not they are still alive. So the
 happens here, every tick, and anything wrong is an E-stop (the daemon puts every joint in
 DAMPING on its next control tick):
 
-- a joint's measured position more than ``track_limit`` from what was commanded (blocked,
-  stalled, or not following),
+- a joint **stalled**: more than ``track_limit`` behind its command and no longer following
+  it (moving at under ``stall_ratio`` of the commanded speed) for ``stall_s``. A loaded arm
+  lifting at speed trails its command by several degrees while still moving (measured: 8 deg
+  on shoulder pitch lifting at 13 deg/s); a blocked or colliding joint stops,
+- any joint more than ``hard_track_limit`` from its command, whatever it's doing,
 - telemetry older than ``stale_s``,
 - a joint that reports a firmware error or is no longer ENABLED.
 
@@ -39,10 +42,17 @@ class MotionStopped(RuntimeError):
 
 class Executor:
     def __init__(self, bus: JointBus, names, limits: JointLimits, rate_hz: float = 50.0,
-                 track_limit_deg: float = 8.0, stale_s: float = 0.3, log=None):
+                 track_limit_deg: float = 8.0, hard_track_limit_deg: float = 15.0,
+                 stall_ratio: float = 0.2, stall_s: float = 0.3, stale_s: float = 0.3, log=None,
+                 on_tick=None):
         self.bus, self.names, self.limits = bus, list(names), limits
         self.period = 1.0 / rate_hz
         self.track_limit = np.radians(track_limit_deg)
+        self.hard_track_limit = np.radians(hard_track_limit_deg)
+        self.stall_ratio, self.stall_s = stall_ratio, stall_s
+        self._stall_since: dict[str, float] = {}
+        self.on_tick = on_tick              # (t, commanded, measured) every streamed tick
+        self.max_track = np.zeros(len(self.names))
         self.stale_s = stale_s
         self.enabled = False
         self.estopped = False
@@ -116,16 +126,36 @@ class Executor:
         self.log("released: DAMPING then IDLE")
 
     # ── motion ───────────────────────────────────────────────────────────────
-    def _check(self, s, commanded) -> None:
-        for n, c in zip(self.names, commanded):
+    def _check(self, s, commanded, cmd_vel=None) -> None:
+        now = time.monotonic()
+        for j, (n, c) in enumerate(zip(self.names, commanded)):
             x = s[n]
             if x.age > self.stale_s:
                 self._abort(f"{n}: telemetry {x.age:.2f} s old")
             if x.error or x.state != "ENABLED":
                 self._abort(f"{n}: state {x.state}, error 0x{x.error:04x}")
-            if abs(x.position - c) > self.track_limit:
-                self._abort(f"{n}: {np.degrees(x.position - c):+.1f} deg from its command "
-                            f"(limit {np.degrees(self.track_limit):.0f})")
+            err = x.position - c
+            self.max_track[j] = max(self.max_track[j], abs(err))
+            if abs(err) > self.hard_track_limit:
+                self._abort(f"{n}: {np.degrees(err):+.1f} deg from its command "
+                            f"(hard limit {np.degrees(self.hard_track_limit):.0f})")
+            if abs(err) > self.track_limit:
+                v_cmd = 0.0 if cmd_vel is None else float(cmd_vel[j])
+                # Behind and still following = lag. Behind and stopped (or the command has
+                # stopped and the joint hasn't come in) = stalled / blocked.
+                following = abs(v_cmd) > 1e-3 and x.velocity * np.sign(v_cmd) > self.stall_ratio * abs(v_cmd)
+                # Once the command has stopped, a trailing joint still coming in is fine too.
+                closing = -x.velocity * np.sign(err) > np.radians(1.0)
+                following = following or closing
+                if following:
+                    self._stall_since.pop(n, None)
+                else:
+                    t0 = self._stall_since.setdefault(n, now)
+                    if now - t0 >= self.stall_s:
+                        self._abort(f"{n}: stalled {np.degrees(err):+.1f} deg from its command "
+                                    f"(moving {np.degrees(x.velocity):+.1f} deg/s, command {np.degrees(v_cmd):+.1f})")
+            else:
+                self._stall_since.pop(n, None)
 
     def run(self, traj: Trajectory, vmax: float, amax: float) -> None:
         """Stream a trajectory. It must start where the joints were last commanded."""
@@ -138,6 +168,7 @@ class Executor:
             raise MotionAborted("trajectory rejected before moving: " + "; ".join(problems))
         if self.last_target is not None and np.abs(traj.q[0] - self.last_target).max() > np.radians(0.5):
             raise MotionAborted("trajectory doesn't start at the last commanded position")
+        vel = traj.velocity()
         t0 = time.monotonic()
         k = 0
         while k < len(traj.t):
@@ -149,7 +180,10 @@ class Executor:
             while k + 1 < len(traj.t) and traj.t[k + 1] <= now:
                 k += 1
             target = traj.q[k]
-            self._check(self.read(), self.last_target)
+            s = self.read()
+            self._check(s, self.last_target, vel[max(0, k - 1)])
+            if self.on_tick:
+                self.on_tick(time.monotonic(), self.last_target, np.array([s[n].position for n in self.names]))
             self.bus.send(dict(zip(self.names, target)))
             self.last_target = target
             if k == len(traj.t) - 1:

@@ -86,6 +86,18 @@ def main() -> int:
         except MotionAborted as e:
             check(f"E-stop on {label}", sim.estopped and all(v == "DAMPING" for v in sim.state.values()), str(e)[:70])
 
+    # A loaded joint lifting at speed trails its command but keeps moving: not a stall.
+    sim = SimBus(dict(zip(NAMES, q0)), tau=0.7)                      # ~10 deg behind at 15 deg/s
+    ex = Executor(sim, NAMES, LIM)
+    qe = ex.enable()
+    lift = movej(NAMES, qe, qe + np.r_[40, 0, 0, 0, 0, 0, 0, 0, 0, 0] * DEG, VMAX, AMAX)
+    try:
+        ex.run(lift, VMAX, AMAX); ex.settle(timeout=6)        # ends ~10 deg behind and has to come in
+        check("a joint trailing by ~10 deg but still following is not E-stopped",
+              8 < np.degrees(ex.max_track.max()) < 15, f"max lag {np.degrees(ex.max_track.max()):.1f} deg")
+    except MotionAborted as e:
+        check("a joint trailing by ~10 deg but still following is not E-stopped", False, str(e)[:80])
+
     sim = SimBus(dict(zip(NAMES, q0)))
     ex = Executor(sim, NAMES, LIM)
     qe = ex.enable()
