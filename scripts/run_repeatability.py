@@ -267,12 +267,23 @@ def main() -> int:
                           "limits": {n: [limits.lower[n], limits.upper[n]] for n in names},
                           "camera_layout": cam.layout_json if cam else None}) + "\n")
     ticks = {"n": 0}
-    def on_tick(t, cmd, meas):
-        # Tracking, 10 times a second: how far each joint trails its command through the moves.
+    torque_limit = {}
+    try:
+        cfgj = json.loads(Path(a.config).read_text())["joints"]
+        torque_limit = {n: float(cfgj[n]["torque_limit"]) for n in names if "torque_limit" in cfgj.get(n, {})}
+    except Exception:
+        pass
+    max_tau = np.zeros(len(names))
+    def on_tick(t, cmd, meas, tau):
+        # Tracking and torque, 10 times a second: how far each joint trails its command, and how
+        # much of its torque limit it's using, through the moves.
         ticks["n"] += 1
+        good = np.isfinite(tau)
+        max_tau[good] = np.maximum(max_tau[good], np.abs(tau[good]))
         if ticks["n"] % 5 == 0:
             out.write(json.dumps({"kind": "track", "t": round(time.time(), 3),
-                                  "cmd": np.round(cmd, 5).tolist(), "meas": np.round(meas, 5).tolist()}) + "\n")
+                                  "cmd": np.round(cmd, 5).tolist(), "meas": np.round(meas, 5).tolist(),
+                                  "tau": [None if not np.isfinite(v) else round(float(v), 3) for v in tau]}) + "\n")
     ex = Executor(bus, names, limits, log=log, on_tick=on_tick)
 
     presses = {"n": 0}
@@ -352,6 +363,8 @@ def main() -> int:
     finally:
         log("largest tracking error per joint (deg): " + ", ".join(
             f"{n.replace('_joint', '')} {np.degrees(v):.1f}" for n, v in zip(names, ex.max_track)))
+        log("largest measured torque per joint (Nm, of its limit): " + ", ".join(
+            f"{n.replace('_joint', '')} {v:.2f}/{torque_limit.get(n, float('nan')):.0f}" for n, v in zip(names, max_tau)))
         log(f"run ended: {status}")
         out.close()
         if cam:

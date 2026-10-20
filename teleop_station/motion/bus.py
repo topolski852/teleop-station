@@ -29,6 +29,8 @@ class JointSample:
     state: str               # daemon JointState: OFFLINE, DISABLED, IDLE, DAMPING, ENABLED, FAULT...
     error: int               # firmware error bitmask
     age: float               # seconds since this joint's telemetry was received
+    torque: float = float("nan")    # Nm measured at the output (slow-polled by the daemon, ~3 Hz)
+    current: float = float("nan")   # A, i_q measured (slow-polled)
 
 
 class JointBus(Protocol):
@@ -68,9 +70,12 @@ class DaemonBus:
         out = {}
         for n in names:
             d = self.client.get_cached_joint_state(n) or {}
+            tq, cu = d.get("torque"), d.get("current")
             out[n] = JointSample(float(d.get("position", 0.0)), float(d.get("velocity", 0.0)),
                                  d.get("state") or d.get("joint_state") or "UNKNOWN",
-                                 int(d.get("error", 0) or 0), age)
+                                 int(d.get("error", 0) or 0), age,
+                                 float(tq) if tq is not None else float("nan"),
+                                 float(cu) if cu is not None else float("nan"))
         return out
 
     def wake(self) -> None:
