@@ -192,10 +192,13 @@ class Executor:
                 break
             time.sleep(max(0.0, min(self.period, traj.t[k + 1] - (time.monotonic() - t0))))
 
-    def settle(self, timeout: float = 3.0, vel_deg_s: float = 0.5, pos_deg: float = 1.0,
+    def settle(self, timeout: float = 3.0, vel_deg_s: float = 0.5, pos_deg: float = 6.0,
                hold_s: float = 0.5) -> dict:
-        """Wait (still streaming nothing new; the daemon holds the target) until every joint is
-        slow and close to its target for ``hold_s``. Returns how it ended."""
+        """Wait (still streaming nothing new; the daemon holds the target) until every joint has
+        stopped moving (under ``vel_deg_s``) for ``hold_s``, and is within ``pos_deg`` of its
+        target. The position test is loose on purpose: a loaded joint sags a steady few degrees
+        below its target under gravity (shoulder pitch ~3 deg at stiffness 45), and that sag is
+        what ``err_deg`` reports, not a reason to wait. Returns how it ended."""
         t0, still_since = time.monotonic(), None
         while True:
             if self._stop:
