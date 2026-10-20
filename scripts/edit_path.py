@@ -167,6 +167,7 @@ def main() -> int:
     ap.add_argument("--limits", default="soft", choices=("soft", "hard"))
     ap.add_argument("--combine", action="store_true",
                     help="arms recorded one after the other: plan each, run them together")
+    ap.add_argument("--only", choices=("left", "right"), help="with --combine: plan just this arm")
     ap.add_argument("--via-speed", type=float, default=8.0, help="split strokes where the hand slowed below this, deg/s")
     ap.add_argument("--background", help="Sony shot of the station for the preview video")
     ap.add_argument("--no-video", action="store_true")
@@ -176,10 +177,11 @@ def main() -> int:
     limits = JointLimits.for_arms(DAEMON_CONFIG, tier=a.limits)
     kw = dict(still_deg=a.still_deg, dwell_s=a.pause_s, smooth_s=a.smooth, max_deviation_deg=a.max_deviation,
               via_speed_deg=a.via_speed)
-    plan = (combine_arms(raw, limits, a.vmax * DEG, a.amax * DEG, **kw) if a.combine
+    sides = (a.only,) if a.only else ("left", "right")
+    plan = (combine_arms(raw, limits, a.vmax * DEG, a.amax * DEG, sides=sides, **kw) if a.combine
             else plan_path(raw, limits, a.vmax * DEG, a.amax * DEG, **kw))
     plan.params["limits"] = a.limits
-    out = Path(a.out or str(Path(a.raw).with_suffix("")) + ".planned.json")
+    out = Path(a.out or str(Path(a.raw).with_suffix("")) + (f".{a.only}" if a.only else "") + ".planned.json")
     print(f"{a.raw}: {raw.t[-1]:.0f} s recorded -> {len(plan.stops)} stops, {len(plan.segments)} moves, "
           f"{plan.duration:.0f} s of motion per cycle at {a.vmax:.0f} deg/s"
           + (f"; arms combined (stops per arm {plan.params.get('stops_per_arm')}), lead-in/out "
@@ -197,9 +199,10 @@ def main() -> int:
     plan.save(out)
     print(f"wrote {out}")
     png = out.with_suffix(".joints.png")
-    joint_plot(raw, plan, limits, png)
-    print(f"wrote {png}")
-    if not a.no_video:
+    if len(plan.names) == len(raw.names):
+        joint_plot(raw, plan, limits, png)
+        print(f"wrote {png}")
+    if not a.no_video and len(plan.names) == len(raw.names):
         bg = a.background
         if not bg:
             shots = sorted(glob.glob(str(ROOT / "runs" / "shots_*" / "*.jpg")), key=os.path.getmtime)

@@ -356,7 +356,10 @@ def combine_arms(raw: RawPath, limits: JointLimits | None, vmax: float, amax: fl
     - **lead-out**: the lead-in in reverse, so the table is only approached along the path
       that was actually taken. Where each arm was put down at the end isn't used.
     """
-    names = raw.names
+    # Only the chosen arms' joints are in the plan: a one-arm plan carries no commands for
+    # the other arm at all (rather than zeros that would drive it somewhere).
+    names = [n for n in raw.names if n.split("_")[0] in sides]
+    raw = RawPath(names, raw.t, raw.q[:, [raw.names.index(n) for n in names]])
     per = {}
     for side in sides:
         cols = [i for i, n in enumerate(names) if n.startswith(side)]
