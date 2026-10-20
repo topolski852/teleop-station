@@ -151,6 +151,10 @@ def build_path_program(path_file, arms, vmax, amax, limits):
     labels = [f"S{k + 1}" for k in range(len(stops))]
     steps = [(seg, labels[(k + 1) % len(stops)], stops[(k + 1) % len(stops)]) for k, seg in enumerate(segs)]
     problems = [p for p in plan.problems if not p.startswith("NOTE")]
+    if len(arms) == 1:
+        # One arm at a time: the other stays resting on the table, as when it was recorded,
+        # so the arms can't meet; the clearance problem doesn't apply.
+        problems = [p for p in problems if "of each other" not in p]
     for k, seg in enumerate(segs):
         problems.extend(f"segment {k + 1}: {p}" for p in limits.check(seg, vmax, amax))
     # Combined paths start and end at rest via a lead-in/lead-out; plain ones at their first stop.

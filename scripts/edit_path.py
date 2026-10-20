@@ -160,7 +160,7 @@ def main() -> int:
     ap.add_argument("--out", help="planned path JSON (default: <raw>.planned.json)")
     ap.add_argument("--vmax", type=float, default=15.0, help="deg/s per joint")
     ap.add_argument("--amax", type=float, default=60.0, help="deg/s^2 per joint")
-    ap.add_argument("--smooth", type=float, default=0.25, help="smoothing, seconds (more = smoother, strays more)")
+    ap.add_argument("--smooth", type=float, default=0.1, help="smoothing, seconds (more = smoother, strays more)")
     ap.add_argument("--pause-s", type=float, default=1.5, help="still this long = a stop")
     ap.add_argument("--still-deg", type=float, default=0.5)
     ap.add_argument("--max-deviation", type=float, default=2.0, help="deg the plan may stray from the recording")

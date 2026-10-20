@@ -308,8 +308,40 @@ def _reverse(tr: Trajectory) -> Trajectory:
     return Trajectory(tr.names, tr.t[-1] - tr.t[::-1], tr.q[::-1].copy())
 
 
+def arm_clearance(names, trajs, hand_m: float = 0.11, step: int = 5) -> tuple[float, int, float]:
+    """Closest the two arms' centre-lines come over some trajectories: (metres, which
+    trajectory, at what time). Each arm is its joint chain from the shoulder roll joint out to
+    a point ``hand_m`` along the wrist link (the hand), in core's URDF geometry, so both arms
+    share the base frame. Compare with the links' thickness, not zero."""
+    from humanoid_core.arm.kinematics import ArmChain
+    from humanoid_core.layout import LIMB_JOINTS
+    chains, cols = {}, {}
+    for side in ("left", "right"):
+        jn = list(LIMB_JOINTS[f"{side}_arm"])
+        if not all(n in names for n in jn):
+            return float("inf"), -1, 0.0
+        chains[side], cols[side] = ArmChain(jn), [names.index(n) for n in jn]
+
+    def polyline(side, q):
+        c = chains[side]
+        qu = c.device_to_urdf(q[cols[side]])
+        F = c.frames(qu)
+        pts = [f[:3, 3] for f in F[1:]] + [F[-1][:3, :3] @ np.array([0, 0, hand_m]) + F[-1][:3, 3]]
+        return np.concatenate([np.linspace(a, b, 8) for a, b in zip(pts, pts[1:])])
+
+    best = (float("inf"), -1, 0.0)
+    for k, tr in enumerate(trajs):
+        for i in range(0, len(tr.t), step):
+            a, b = polyline("left", tr.q[i]), polyline("right", tr.q[i])
+            d = float(np.linalg.norm(a[:, None] - b[None], axis=2).min())
+            if d < best[0]:
+                best = (d, k, float(tr.t[i]))
+    return best
+
+
 def combine_arms(raw: RawPath, limits: JointLimits | None, vmax: float, amax: float,
-                 sides=("left", "right"), dt: float = 0.02, **kw) -> PlannedPath:
+                 sides=("left", "right"), dt: float = 0.02, min_clearance_m: float = 0.15,
+                 **kw) -> PlannedPath:
     """Arms recorded one after the other, run together.
 
     Each arm's part of the recording is planned on its own (``plan_path``: its pauses become
@@ -376,12 +408,23 @@ def combine_arms(raw: RawPath, limits: JointLimits | None, vmax: float, amax: fl
         for k, dev in enumerate(d["dev"][:len(air[s])]):
             if dev > max_dev:
                 problems.append(f"{s} arm move {k + 1} strays {dev:.1f} deg from the recording (max {max_dev:.1f})")
+    # Each arm's part was safe as recorded because the other arm sat on the table. Run
+    # together they can meet, which no one ever tried by hand: check the clearance.
+    program = [lead_in] + segments
+    d, k, at = arm_clearance(names, program)
+    params_clear = round(d, 4)
+    if d < min_clearance_m:
+        what = "the lead-in (and lead-out)" if k == 0 else f"cycle move {k}"
+        problems.append(f"the arms come within {d * 1000:.0f} mm of each other (centre-lines, min "
+                        f"{min_clearance_m * 1000:.0f}) during {what} at t={at:.1f} s: they would collide "
+                        f"running together. Run one arm at a time (--arms left, then --arms right), or "
+                        f"record poses that keep them apart.")
     if limits:
         for label, trs in (("lead-in", [lead_in]), ("cycle move", segments)):
             for k, tr in enumerate(trs):
                 problems.extend(f"{label} {k + 1}: {p}" for p in limits.check(tr, vmax, amax))
         for k, q in enumerate(stops):
             problems.extend(f"stop {k + 1}: {p}" for p in limits.violations(names, q))
-    params = dict(kw, combined=True, vmax=vmax, amax=amax,
-                  stops_per_arm={s: len(v) for s, v in air.items()})
+    params = dict(kw, combined=True, vmax=vmax, amax=amax, clearance_m=params_clear,
+                  min_clearance_m=min_clearance_m, stops_per_arm={s: len(v) for s, v in air.items()})
     return PlannedPath(names, stops, segments, closes, deviation, problems, params, rest, [lead_in], [lead_out])

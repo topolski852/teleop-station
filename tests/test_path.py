@@ -103,6 +103,25 @@ def main() -> int:
     p4 = plan_path(recording(far), LIM, VMAX, AMAX)
     check("a path past a joint limit is reported", any("limits" in p for p in p4.problems))
 
+    print("\n── the two arms together ────────────────────────────────────────")
+    from teleop_station.motion import Trajectory
+    from teleop_station.motion.path import arm_clearance
+    one = lambda q: arm_clearance(NAMES, [Trajectory(NAMES, np.array([0.0]), np.atleast_2d(q))], step=1)[0]
+    hang = np.zeros(len(NAMES))
+    reach_in = np.r_[30, 0, 90, 90, 0, -30, 0, -90, -90, 0] * DEG          # both forearms turned inward
+    check("arms hanging are well apart (centre-lines > 300 mm)", one(hang) > 0.30, f"{one(hang) * 1000:.0f} mm")
+    check("both forearms turned inward bring the hands together (< 50 mm)", one(reach_in) < 0.05,
+          f"{one(reach_in) * 1000:.0f} mm")
+    from teleop_station.motion import combine_arms
+    rest_c = np.zeros(len(NAMES)); rest_c[3], rest_c[8] = 60 * DEG, -60 * DEG
+    near = rest_c.copy(); near[[0, 2, 3]] = np.r_[30, 85, 88] * DEG; near_r = rest_c.copy(); near_r[[5, 7, 8]] = np.r_[-30, -85, -88] * DEG
+    mid_l = rest_c.copy(); mid_l[[0, 3]] = np.r_[30, 80] * DEG; mid_r = rest_c.copy(); mid_r[[5, 8]] = np.r_[-30, -80] * DEG
+    seq = recording([rest_c, mid_l, near, rest_c, mid_r, near_r, rest_c])
+    hard = JointLimits.for_arms("/home/nse/humanoid-studio/configs/humanoid_arms.json", tier="hard")
+    pc = combine_arms(seq, hard, VMAX, AMAX, dwell_s=0.4)
+    check("arms recorded apart but run together into each other are refused",
+          any("of each other" in p for p in pc.problems), f"clearance {pc.params.get('clearance_m', 0) * 1000:.0f} mm")
+
     print("\n── streaming one segment to a simulated arm ─────────────────────")
     sim = SimBus(dict(zip(NAMES, plan.stops[0])))
     ex = Executor(sim, NAMES, LIM)
