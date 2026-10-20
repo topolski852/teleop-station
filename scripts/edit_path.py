@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from teleop_station.motion import JointLimits, RawPath, combine_arms, plan_path   # noqa: E402
+from teleop_station.motion import JointLimits, RawPath, combine_arms, mirror_arm, plan_path   # noqa: E402
 
 DEG = np.pi / 180
 DAEMON_CONFIG = "/home/nse/humanoid-studio/configs/humanoid_arms.json"
@@ -168,6 +168,8 @@ def main() -> int:
     ap.add_argument("--combine", action="store_true",
                     help="arms recorded one after the other: plan each, run them together")
     ap.add_argument("--only", choices=("left", "right"), help="with --combine: plan just this arm")
+    ap.add_argument("--mirror", action="store_true",
+                    help="plan the LEFT arm from the recording, and run the right arm as its mirror image")
     ap.add_argument("--via-speed", type=float, default=8.0, help="split strokes where the hand slowed below this, deg/s")
     ap.add_argument("--background", help="Sony shot of the station for the preview video")
     ap.add_argument("--no-video", action="store_true")
@@ -177,11 +179,14 @@ def main() -> int:
     limits = JointLimits.for_arms(DAEMON_CONFIG, tier=a.limits)
     kw = dict(still_deg=a.still_deg, dwell_s=a.pause_s, smooth_s=a.smooth, max_deviation_deg=a.max_deviation,
               via_speed_deg=a.via_speed)
-    sides = (a.only,) if a.only else ("left", "right")
-    plan = (combine_arms(raw, limits, a.vmax * DEG, a.amax * DEG, sides=sides, **kw) if a.combine
+    sides = ("left",) if a.mirror else ((a.only,) if a.only else ("left", "right"))
+    plan = (combine_arms(raw, limits, a.vmax * DEG, a.amax * DEG, sides=sides, **kw) if (a.combine or a.mirror)
             else plan_path(raw, limits, a.vmax * DEG, a.amax * DEG, **kw))
+    if a.mirror and plan.segments:
+        plan = mirror_arm(plan, limits, a.vmax * DEG, a.amax * DEG)
     plan.params["limits"] = a.limits
-    out = Path(a.out or str(Path(a.raw).with_suffix("")) + (f".{a.only}" if a.only else "") + ".planned.json")
+    tag = ".mirror" if a.mirror else (f".{a.only}" if a.only else "")
+    out = Path(a.out or str(Path(a.raw).with_suffix("")) + tag + ".planned.json")
     print(f"{a.raw}: {raw.t[-1]:.0f} s recorded -> {len(plan.stops)} stops, {len(plan.segments)} moves, "
           f"{plan.duration:.0f} s of motion per cycle at {a.vmax:.0f} deg/s"
           + (f"; arms combined (stops per arm {plan.params.get('stops_per_arm')}), lead-in/out "

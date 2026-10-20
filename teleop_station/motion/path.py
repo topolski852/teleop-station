@@ -431,3 +431,51 @@ def combine_arms(raw: RawPath, limits: JointLimits | None, vmax: float, amax: fl
     params = dict(kw, combined=True, vmax=vmax, amax=amax, clearance_m=params_clear,
                   min_clearance_m=min_clearance_m, stops_per_arm={s: len(v) for s, v in air.items()})
     return PlannedPath(names, stops, segments, closes, deviation, problems, params, rest, [lead_in], [lead_out])
+
+
+def mirror_arm(plan: PlannedPath, limits: JointLimits | None, vmax: float, amax: float,
+               min_clearance_m: float = 0.15) -> PlannedPath:
+    """A one-arm plan (the left arm's) run on both arms at once, the right mirroring the left.
+
+    In device frame the mirror is simply right = -left on every joint: with both shoulder
+    pitches counting against the URDF axis (core joint_sign -1), core's kinematics put the
+    right arm at -q exactly where the left arm at q is, reflected left-right (checked to
+    0.00 mm). Physically that holds as far as both arms are zeroed. Then the same checks as
+    any two-arm plan: limits (the right arm's own, which aren't an exact mirror) and clearance
+    (mirrored arms that both reach in toward the middle meet there).
+    """
+    left = [n for n in plan.names if n.startswith("left_")]
+    if left != plan.names:
+        raise ValueError("mirror_arm takes a left-arm-only plan")
+    right = ["right_" + n[len("left_"):] for n in left]
+    names = left + right
+
+    def both(q):
+        q = np.atleast_2d(q)
+        return np.hstack([q, -q])
+
+    def tr(t):
+        return Trajectory(names, t.t.copy(), both(t.q))
+
+    stops = [both(q)[0] for q in plan.stops]
+    out = PlannedPath(names, stops, [tr(s) for s in plan.segments], plan.closes_loop,
+                      list(plan.deviation_deg), [p for p in plan.problems if p.startswith("NOTE")],
+                      dict(plan.params, mirrored=True),
+                      None if plan.rest is None else both(plan.rest)[0],
+                      [tr(s) for s in plan.lead_in], [tr(s) for s in plan.lead_out])
+    out.problems += [p for p in plan.problems if not p.startswith("NOTE")]
+    d, k, at = arm_clearance(names, out.lead_in + out.segments)
+    out.params["clearance_m"] = round(d, 4)
+    if d < min_clearance_m:
+        what = "the lead-in (and lead-out)" if (out.lead_in and k == 0) else f"move {k + (0 if out.lead_in else 1)}"
+        out.problems.append(f"mirrored, the arms come within {d * 1000:.0f} mm of each other (centre-lines, min "
+                            f"{min_clearance_m * 1000:.0f}) during {what} at t={at:.1f} s: keep the left arm "
+                            f"on its own side, out of the middle")
+    if limits:
+        for label, trs in (("lead-in", out.lead_in), ("move", out.segments)):
+            for i, t in enumerate(trs):
+                out.problems.extend(f"{label} {i + 1}: {p}" for p in limits.check(t, vmax, amax)
+                                    if p.split(" ")[0].startswith("right_"))
+        for i, q in enumerate(out.stops):
+            out.problems.extend(f"stop {i + 1}: {p}" for p in limits.violations(names, q) if p.startswith("right_"))
+    return out
