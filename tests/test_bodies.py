@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_vision as V                                                          # noqa: E402
 from teleop_station.vision import CameraCalibration, Pose, TagTracker, survey_body   # noqa: E402
+from teleop_station.vision.tags import Sighting, _tag_object_points                                 # noqa: E402
 
 PASS, FAIL = [], []
 RNG = np.random.default_rng(11)
@@ -88,6 +89,38 @@ def main() -> int:
           ", ".join(f"{i}: {e:.2f}" for i, e in errs.items()) + " mm")
     check("the opposite face was reached through a neighbour", info.get(14, {}).get("via") not in (None, 10),
           f"via {info.get(14, {}).get('via')}")
+
+    print("\n── refining the layout on the corners (bundle adjustment) ───────")
+    # Exact projections plus 0.15 px noise (rendered tags carry their own corner bias, ~0.3 px
+    # with an exact camera, more than the real photos' 0.12-0.18). Each tag's own pose comes
+    # from its four corners, as the detector's does, so the chained survey carries that error.
+    obj = _tag_object_points(0.0367).astype(np.float64)
+    rng = np.random.default_rng(5)    # its own, so the checks after it see the same views
+    noisy = []
+    for k in range(60):
+        R = V.rot(*rng.uniform(-np.pi, np.pi, 3))
+        cam_from_cube = Pose(R, np.array([*rng.uniform(-0.05, 0.05, 2), rng.uniform(0.32, 0.42)]))
+        seen = {}
+        for i, p in faces.items():
+            T = cam_from_cube @ p
+            if T.R[:, 2] @ (-T.t / np.linalg.norm(T.t)) < 0.25:
+                continue
+            img = cv2.projectPoints(obj @ T.R.T + T.t, np.zeros(3), np.zeros(3), V.K_TRUE, V.NO_DIST)[0].reshape(-1, 2)
+            img = img + rng.normal(0, 0.15, img.shape)
+            ok, rv, tv = cv2.solvePnP(obj, img, V.K_TRUE, V.NO_DIST, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            seen[i] = Sighting(Pose(cv2.Rodrigues(rv)[0], tv.ravel()), img, float(np.linalg.norm(img[0] - img[1])))
+        noisy.append(seen)
+    ids = (10, 11, 12, 13, 14)
+    def worst(lay):
+        mm = max(np.linalg.norm(lay[i].t - rel_true[i].t) * 1000 for i in lay)
+        deg = max(np.degrees(np.arccos(np.clip(((lay[i].R.T @ rel_true[i].R).trace() - 1) / 2, -1, 1))) for i in lay)
+        return mm, deg
+    chained, _ = survey_body(ids, noisy, min_pairs=2)
+    refined, rinfo = survey_body(ids, noisy, min_pairs=2, calib=exact, sizes_m=tags.sizes_m)
+    (cm, cd), (rm, rd) = worst(chained), worst(refined)
+    check("the corner fit places every face better than chaining, within 0.3 mm and 0.2 deg",
+          sorted(refined) == [11, 12, 13, 14] and rm < cm and rd < cd and rm < 0.3 and rd < 0.2,
+          f"chained {cm:.2f} mm {cd:.2f} deg, refined {rm:.2f} mm {rd:.2f} deg, {rinfo['refined']['rms_px']:.2f} px")
 
     print("\n── fitting the cube from whichever faces are visible ────────────")
     t2 = replace(tags, body_layout={"hand": layout})

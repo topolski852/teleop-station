@@ -306,7 +306,8 @@ def survey(tags: TagSet, sightings: list[dict[int, Sighting]], outlier_m: float 
 
 
 def survey_body(ids, sightings: list[dict[int, Sighting]], outlier_m: float = 0.005,
-                min_pairs: int = 3, max_view_deg: float = 65.0) -> tuple[dict[int, Pose], dict]:
+                min_pairs: int = 3, max_view_deg: float = 65.0, calib: CameraCalibration | None = None,
+                sizes_m: dict[int, float] | None = None) -> tuple[dict[int, Pose], dict]:
     """Each tag of a rigid body in its anchor's (``ids[0]``) frame, from frames where tags of
     the body are seen together.
 
@@ -319,6 +320,12 @@ def survey_body(ids, sightings: list[dict[int, Sighting]], outlier_m: float = 0.
     A tag seen more than ``max_view_deg`` off face-on is left out: its own pose gets unreliable
     as it turns edge-on (a cube's end face seen at 70 deg put the left cube 5 mm too wide on
     2026-10-20, where the right cube's at 63 deg was fine).
+
+    Given ``calib`` and ``sizes_m``, the chained layout is then refined on the image corners
+    (``refine_body``). Chaining alone carries each tag's own pose error: a single tag's tilt
+    from its four corners is biased by up to ~0.7 deg at these viewing angles, and on the left
+    cube (2026-10-20) four side faces chained to 362.6 deg round the cube, putting the whole
+    2.6 deg on the one pair never measured directly. Refined, both cubes are square to 0.4 deg.
     """
     anchor = ids[0]
     rel: dict[tuple[int, int], list[Pose]] = {}
@@ -350,7 +357,87 @@ def survey_body(ids, sightings: list[dict[int, Sighting]], outlier_m: float = 0.
         info[b] = {"via": a, "frames": n}
     layout.pop(anchor)
     info.pop(anchor)
+    if calib is not None and sizes_m is not None and layout:
+        layout, fit = refine_body(ids, sightings, layout, calib, sizes_m, max_view_deg)
+        info["refined"] = fit
     return layout, info
+
+
+def refine_body(ids, sightings: list[dict[int, Sighting]], layout: dict[int, Pose],
+                calib: CameraCalibration, sizes_m: dict[int, float], max_view_deg: float = 65.0,
+                iters: int = 30) -> tuple[dict[int, Pose], dict]:
+    """Bundle adjustment of a body layout: every placed tag's pose in the anchor frame and the
+    body's pose in each frame together, minimising the corner reprojection error over every
+    frame that shows two or more placed tags (Levenberg-Marquardt, numeric Jacobian; small
+    problems, a few dozen frames). Returns the refined layout and {"rms_px", "tag_rms_px",
+    "frames"}."""
+    anchor = ids[0]
+    placed = [i for i in ids[1:] if i in layout]
+    frames = []
+    for s in sightings:
+        v = {i: s[i] for i in [anchor] + placed if i in s and s[i].view_deg <= max_view_deg}
+        if len(v) >= 2:
+            frames.append(v)
+    if not frames:
+        return layout, {"rms_px": None, "tag_rms_px": {}, "frames": 0}
+    obj = {i: _tag_object_points(sizes_m[i]).astype(np.float64) for i in [anchor] + placed}
+    K, D = calib.K, calib.dist
+    vec = lambda p: np.r_[cv2.Rodrigues(p.R)[0].ravel(), p.t]
+    pose = lambda x: Pose(cv2.Rodrigues(x[:3])[0], x[3:6].copy())
+
+    def body_guess(v):
+        i = max(v, key=lambda k: v[k].side_px)
+        return v[i].pose @ (layout[i].inverse() if i != anchor else Pose(np.eye(3), np.zeros(3)))
+
+    nl = 6 * len(placed)
+    x = np.concatenate([vec(layout[i]) for i in placed] + [vec(body_guess(v)) for v in frames])
+
+    def frame_res(x, f):
+        lay = {anchor: Pose(np.eye(3), np.zeros(3)), **{i: pose(x[6 * k:6 * k + 6]) for k, i in enumerate(placed)}}
+        b = x[nl + 6 * f:nl + 6 * f + 6]
+        out = []
+        for i, s in frames[f].items():
+            P = obj[i] @ lay[i].R.T + lay[i].t
+            img = cv2.projectPoints(P, b[:3], b[3:], K, D)[0].reshape(-1, 2)
+            out.append((img - s.corners).ravel())
+        return np.concatenate(out)
+
+    def residuals(x):
+        return [frame_res(x, f) for f in range(len(frames))]
+
+    rows = np.cumsum([0] + [8 * len(v) for v in frames])
+    r = residuals(x)
+    lam, h = 1e-3, 1e-6
+    for _ in range(iters):
+        rv = np.concatenate(r)
+        J = np.zeros((rv.size, x.size))
+        for j in range(x.size):
+            dx = np.zeros_like(x); dx[j] = h
+            if j < nl:                   # a layout parameter moves every frame
+                J[:, j] = (np.concatenate(residuals(x + dx)) - rv) / h
+            else:                        # a body pose only its own frame
+                f = (j - nl) // 6
+                J[rows[f]:rows[f + 1], j] = (frame_res(x + dx, f) - r[f]) / h
+        A, g = J.T @ J, J.T @ rv
+        while lam < 1e8:
+            step = np.linalg.solve(A + lam * np.diag(np.diag(A) + 1e-12), -g)
+            r2 = residuals(x + step)
+            if sum(e @ e for e in r2) < rv @ rv:
+                x, r, lam = x + step, r2, lam / 3
+                break
+            lam *= 10
+        else:
+            break
+        if np.abs(step).max() < 1e-9:
+            break
+    per: dict[int, list] = {}
+    for v, e in zip(frames, r):
+        for k, i in enumerate(v):
+            per.setdefault(i, []).append(e[8 * k:8 * k + 8])
+    rv = np.concatenate(r)
+    fit = {"rms_px": float(np.sqrt(np.mean(rv ** 2))), "frames": len(frames),
+           "tag_rms_px": {str(i): round(float(np.sqrt(np.mean(np.concatenate(e) ** 2))), 3) for i, e in sorted(per.items())}}
+    return {i: pose(x[6 * k:6 * k + 6]) for k, i in enumerate(placed)}, fit
 
 
 def mean_pose(poses: list[Pose]) -> tuple[Pose, np.ndarray]:

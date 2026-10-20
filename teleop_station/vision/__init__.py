@@ -13,10 +13,10 @@ tags so a bumped tripod moves the camera, not the numbers.
 """
 from .calib import CameraCalibration, charuco_board
 from .tags import (DEFAULT_TAGS, Pose, ReferenceFit, Sighting, TagSet, TagTracker, load_body_layout,
-                   mean_pose, save_body_layout, survey, survey_body)
+                   mean_pose, refine_body, save_body_layout, survey, survey_body)
 
 __all__ = [
     "CameraCalibration", "charuco_board",
     "DEFAULT_TAGS", "Pose", "ReferenceFit", "Sighting", "TagSet", "TagTracker", "load_body_layout",
-    "mean_pose", "save_body_layout", "survey", "survey_body",
+    "mean_pose", "refine_body", "save_body_layout", "survey", "survey_body",
 ]

@@ -3,6 +3,7 @@
 
     python scripts/spin_survey.py --path runs/path_raw_test3.mirror.planned.json --dry-run
     python scripts/spin_survey.py --path runs/path_raw_test3.mirror.planned.json
+    python scripts/spin_survey.py --path runs/path_raw_test3.mirror.planned.json --at-stops --shots 1
 
 The arms go out along the path's recorded lead-in to its first stop (S1), clear of the table.
 There only the wrists turn, from ``-range`` to ``+range`` degrees about where they started,
@@ -11,6 +12,11 @@ stills. Turning the cube past the camera shows its side faces in neighbouring pa
 what ``survey_body`` needs to place every face, the far ones included. Then the wrists turn
 back, the arms return along the lead-out, and each body's layout is written to
 ``config/body_layout.json`` (with how each tag was reached and from how many frames).
+
+With ``--at-stops`` the arms go round the whole taught path once and the wrists sweep at every
+stop. Each stop puts the cube somewhere else in front of the camera: raised elbows show the
+end face, and the side faces turn past at different angles, so pairs that one pose only ever
+shows half edge-on (22 and 68 deg at S1 on 2026-10-20) come up nearer 45/45 at another.
 
 The wrist sweep needs wrist limits at least as wide as the range (``scripts/apply_arm_config.py``
 after widening them in the daemon config). Everything else is the runner's: every move is
@@ -56,13 +62,17 @@ def survey_only(a, arms, stamp) -> int:
     for body, ids in tags.bodies.items():
         if len(ids) < 2 or not any(body.startswith(s) for s in arms):
             continue
-        lay, inf = survey_body(ids, sightings, min_pairs=2, max_view_deg=a.max_view)
+        lay, inf = survey_body(ids, sightings, min_pairs=2, max_view_deg=a.max_view,
+                               calib=CameraCalibration.load(a.calib), sizes_m=tags.sizes_m)
         ok = lambda s, i: i in s and s[i].view_deg <= a.max_view
         pairs = {f"{x}-{y}": sum(ok(s, x) and ok(s, y) for s in sightings) for i, x in enumerate(ids) for y in ids[i + 1:]}
         missing = [i for i in ids[1:] if i not in lay]
         layout[body] = lay
         info[body] = {"reached": {str(k): v for k, v in inf.items()}, "pairs_seen": pairs, "missing": missing}
         print(f"{body}: placed {sorted(lay)}" + (f", NOT placed {missing}" if missing else "") + f"; usable pairs {pairs}")
+        if "refined" in inf:
+            print(f"{body}: corner fit {inf['refined']['rms_px']:.2f} px over {inf['refined']['frames']} frames, "
+                  f"per tag {inf['refined']['tag_rms_px']}")
     save_body_layout(a.out_layout, layout, {"surveyed": stamp, "source": "spin_survey --only-survey", "folders": a.also, **info})
     print(f"wrote {a.out_layout}")
     return 0
@@ -74,6 +84,8 @@ def main() -> int:
     ap.add_argument("--at-rest", action="store_true",
                     help="don't move the arms: enable ONLY the wrists and turn them where the arms rest "
                          "(when the cubes clear the table there)")
+    ap.add_argument("--at-stops", action="store_true",
+                    help="go round the whole path once, sweeping the wrists at every stop")
     ap.add_argument("--arms", default="both", choices=("both", "left", "right"))
     ap.add_argument("--step", type=float, default=45.0, help="wrist step, deg")
     ap.add_argument("--range", type=float, default=180.0, help="turn each wrist this far each way, deg")
@@ -96,6 +108,8 @@ def main() -> int:
     arms = ["left", "right"] if a.arms == "both" else [a.arms]
     if a.only_survey:
         return survey_only(a, arms, stamp)
+    if a.at_stops and (a.at_rest or not a.path):
+        sys.exit("--at-stops needs --path (and not --at-rest)")
     limits = JointLimits.for_arms(a.config, arms=[f"{s}_arm" for s in arms], tier=a.limits)
     vmax, amax = a.vmax * DEG, a.amax * DEG
     if a.at_rest:
@@ -119,30 +133,45 @@ def main() -> int:
     problems = [p for p in problems if "of each other" not in p]
     s1 = lead_in[-1].q[-1].copy() if lead_in else rest.copy()
     wrist = [k for k, n in enumerate(names) if n.endswith("wrist_yaw_joint")]
-    # One monotonic sweep: out to -range, then up in steps to +range (shots at each), then home.
     order = list(np.arange(-a.range, a.range + 1e-6, a.step))
-    targets = []
-    for o in order:
-        q = s1.copy(); q[wrist] = s1[wrist] + o * DEG
-        targets.append((o, q))
-    sweep, prev = [], s1
-    for o, q in targets:
-        sweep.append((o, movej(names, prev, q, vmax, amax), True)); prev = q
-    sweep.append((0.0, movej(names, prev, s1, vmax, amax), False))
-    for o, tr, _ in sweep:
-        problems.extend(f"wrist to {o:+.0f}: {p}" for p in limits.check(tr, vmax, amax))
+
+    def make_sweep(c):
+        """One monotonic sweep about ``c``: out to -range, then up in steps to +range (shots
+        at each), then back to exactly ``c``, so the path carries on from where it stopped."""
+        out, prev = [], c
+        for o in order:
+            q = c.copy(); q[wrist] = c[wrist] + o * DEG
+            out.append((o, movej(names, prev, q, vmax, amax), True)); prev = q
+        out.append((0.0, movej(names, prev, c, vmax, amax), False))
+        return out
+
+    # (stop, path segment that gets there or None, sweep there). The last segment only
+    # returns to S1, already swept.
+    program = [("S1", None, make_sweep(s1))]
+    if a.at_stops:
+        program += [(label, seg, make_sweep(seg.q[-1].copy())) for seg, label, _ in steps[:-1]]
+        program.append(("S1", steps[-1][0], []))
+    for label, _, sw in program:
+        for o, tr, _ in sw:
+            problems.extend(f"{label} wrist to {o:+.0f}: {p}" for p in limits.check(tr, vmax, amax))
+    moves = [tr for _, seg, sw in program for tr in ([seg] if seg else []) + [t for _, t, _ in sw]]
+    shots = sum(shoot for _, _, sw in program for _, _, shoot in sw) * a.shots
     if len(arms) == 2 and not a.at_rest:
         from teleop_station.motion.path import arm_clearance
-        d, k, at = arm_clearance(names, lead_in + [tr for _, tr, _ in sweep] + lead_out)
+        d, k, at = arm_clearance(names, lead_in + moves + lead_out)
         if d < 0.15:
             problems.append(f"the arms come within {d * 1000:.0f} mm of each other during the survey's moves")
         else:
-            print(f"  arms stay {d * 1000:.0f} mm apart (centre-lines) through the lead-in, sweep and lead-out")
+            print(f"  arms stay {d * 1000:.0f} mm apart (centre-lines) through the lead-in, path, sweeps and lead-out")
     where = ("arms resting where they are, ONLY the wrists enabled" if a.at_rest else
              f"arm(s) out to S1 via the recorded lead-in ({lead_in[0].duration:.0f} s)")
-    print(f"spin survey: {' and '.join(arms)}: {where}; wrists {order[0]:+.0f}..{order[-1]:+.0f} deg about "
-          f"{', '.join(f'{np.degrees(s1[k]):+.0f}' for k in wrist)} in {a.step:.0f} deg steps "
-          f"({len(targets)} positions x {a.shots} shots), then back")
+    at = f"at each of the {len(program) - 1} stops" if a.at_stops else \
+        f"about {', '.join(f'{np.degrees(s1[k]):+.0f}' for k in wrist)}"
+    print(f"spin survey: {' and '.join(arms)}: {where}; wrists {order[0]:+.0f}..{order[-1]:+.0f} deg {at} "
+          f"in {a.step:.0f} deg steps ({len(order)} positions x {a.shots} shots), then back")
+    # Moves, about 1 s to settle after each, about 3 s per still (gphoto2 tethered).
+    secs = sum(tr.duration for tr in lead_in + moves + lead_out) + len(moves) + 3 * shots
+    print(f"  {shots} shots, about {secs / 60:.0f} min")
     if problems:
         print("REJECTED, nothing was enabled:\n  " + "\n  ".join(problems))
         print("(if it's the wrist limits: widen wrist_yaw position_limits in the daemon config, "
@@ -183,19 +212,25 @@ def main() -> int:
             raise MotionAborted("the wrists moved between planning and enabling; run it again")
         else:
             ex.last_target = s1.copy()
-        for o, tr, shoot in sweep:
-            ex.run(tr, vmax, amax)
-            st = ex.settle()
-            if cam is not None and shoot:
-                for _ in range(a.shots):
-                    ok, f = cam.read()
-                    if ok:
-                        seen = tracker.detect(f)
-                        sightings.append(seen)
-                        log_rows.append({"wrist_offset_deg": o, "seen": sorted(seen)})
-                print(f"  wrist {o:+5.0f} deg: settled {st['settled']}, tags seen {log_rows[-1]['seen'] if log_rows else '-'}")
-            else:
-                print(f"  wrist {o:+5.0f} deg: settled {st['settled']}")
+        for label, seg, sw in program:
+            if seg is not None:
+                ex.run(seg, vmax, amax)
+                ex.settle()
+                print(f"  at {label}")
+            for o, tr, shoot in sw:
+                ex.run(tr, vmax, amax)
+                st = ex.settle()
+                if cam is not None and shoot:
+                    for _ in range(a.shots):
+                        ok, f = cam.read()
+                        if ok:
+                            seen = tracker.detect(f)
+                            sightings.append(seen)
+                            log_rows.append({"stop": label, "wrist_offset_deg": o, "seen": sorted(seen)})
+                    print(f"  {label} wrist {o:+5.0f} deg: settled {st['settled']}, "
+                          f"tags seen {log_rows[-1]['seen'] if log_rows else '-'}")
+                else:
+                    print(f"  {label} wrist {o:+5.0f} deg: settled {st['settled']}")
         for seg in lead_out:
             ex.run(seg, vmax, amax)
         if np.abs(ex.last_target - rest).max() > 1e-6:
@@ -229,13 +264,14 @@ def main() -> int:
     if not sightings:
         return 0 if status == "ok" else 1
 
-    from teleop_station.vision import TagSet, save_body_layout, survey_body
+    from teleop_station.vision import CameraCalibration, TagSet, save_body_layout, survey_body
     tags = TagSet.load(ROOT / "config" / "tags.json")
     layout, info = {}, {}
     for body, ids in tags.bodies.items():
         if len(ids) < 2 or not any(body.startswith(s) for s in arms):
             continue
-        lay, inf = survey_body(ids, sightings, min_pairs=2, max_view_deg=a.max_view)
+        lay, inf = survey_body(ids, sightings, min_pairs=2, max_view_deg=a.max_view,
+                               calib=CameraCalibration.load(a.calib), sizes_m=tags.sizes_m)
         oblique = sum(1 for s in sightings for i in ids if i in s and s[i].view_deg > a.max_view)
         layout[body] = lay
         ok = lambda s, i: i in s and s[i].view_deg <= a.max_view
@@ -246,13 +282,17 @@ def main() -> int:
         print(f"{body}: anchor {ids[0]}, placed {sorted(lay)}" +
               (f", NOT placed {info[body]['missing']}" if info[body]["missing"] else "") +
               f"; pairs seen together {pairs}")
+        if "refined" in inf:
+            print(f"{body}: corner fit {inf['refined']['rms_px']:.2f} px over {inf['refined']['frames']} frames, "
+                  f"per tag {inf['refined']['tag_rms_px']}")
     old = Path(a.out_layout)
     merged = {}
     if old.exists():
         from teleop_station.vision import load_body_layout
         merged = load_body_layout(old)
     merged.update(layout)
-    save_body_layout(a.out_layout, merged, {"surveyed": stamp, "source": "spin_survey", **info})
+    save_body_layout(a.out_layout, merged, {"surveyed": stamp, "source": "spin_survey --at-stops" if a.at_stops else "spin_survey",
+                                                  "folders": a.also, **info})
     Path(ROOT / "runs").mkdir(exist_ok=True)
     (ROOT / "runs" / f"spin_{stamp}.json").write_text(json.dumps({"rows": log_rows, "info": info}, indent=2) + "\n")
     print(f"wrote {a.out_layout}")

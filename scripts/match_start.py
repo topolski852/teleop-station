@@ -29,10 +29,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path")
     ap.add_argument("--tol", type=float, default=3.0)
+    ap.add_argument("--arms", default="both", choices=("both", "left", "right"),
+                    help="only these arm's joints (the other stays where it rests)")
     ap.add_argument("--config", default=DAEMON_CONFIG)
     a = ap.parse_args()
     plan = PlannedPath.load(a.path)
     start = plan.lead_in[0].q[0] if plan.lead_in else plan.stops[0]
+    keep = [i for i, n in enumerate(plan.names) if a.arms == "both" or n.startswith(a.arms + "_")]
+    plan.names, start = [plan.names[i] for i in keep], np.asarray(start)[keep]
     bus = DaemonBus(a.config)
     s = bus.read(plan.names)
     stiff = {n.replace("_joint", ""): x.state for n, x in s.items() if x.state != "IDLE"}
@@ -52,12 +56,16 @@ def main() -> int:
         while not done.is_set():
             s = bus.read(plan.names)
             d = np.degrees(np.array([s[n].position for n in plan.names]) - start)
+            # Only the joints still off, named with their arm, so the line stays short enough
+            # to redraw in place (a wrapped line repeats down the terminal instead).
             parts = []
             for n, v in zip(plan.names, d):
-                tag = "ok" if abs(v) <= a.tol else ("move +" if v < 0 else "move -")
-                parts.append(f"{n.split('_', 1)[1].replace('_joint', '').replace('shoulder_', 'sh_')} {v:+6.1f} {tag:6s}")
-            allok = np.abs(d).max() <= a.tol
-            print("\r  " + "  ".join(parts) + ("   ALL OK" if allok else "         "), end="", flush=True)
+                if abs(v) > a.tol:
+                    arm, joint = n.split("_", 1)
+                    joint = joint.replace("_joint", "").replace("shoulder_", "sh_")
+                    parts.append(f"{arm[0].upper()} {joint} {v:+.0f} (move {'+' if v < 0 else '-'})")
+            line = "ALL OK, press Enter" if not parts else f"{len(parts)} off: " + ", ".join(parts)
+            print("\r\033[K  " + line, end="", flush=True)
             time.sleep(0.1)
     finally:
         bus.close()
