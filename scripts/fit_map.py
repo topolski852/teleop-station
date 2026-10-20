@@ -51,18 +51,40 @@ TAG_LINK = {"shoulder_roll": 1, "wrist": 3, "hand": 4}
 FIT_OFFSETS = (1, 2, 3)
 
 
-def load_frames(paths):
+def load_frames(paths, zero_records=()):
+    """Frames from record_map/view_map runs. ``zero_records`` (runs/zero_*.json) are offset
+    writes made between runs: frames recorded before one get its reading shifts added, so
+    every frame reads in the latest zero."""
+    import time as _time
+    shifts = []
+    for z in zero_records:
+        rec = json.loads(Path(z).read_text())
+        t_write = _time.mktime(_time.strptime(rec["started"], "%Y-%m-%d %H:%M:%S"))
+        shifts.append((t_write, {j["joint"]: np.radians(j["reading_shift_deg"])
+                                 for j in rec["joints"] if j.get("ok")}))
     t, joints, tags = [], [], []
     for p in paths:
         for line in open(p):
             r = json.loads(line)
             if r["kind"] == "frame" and r.get("ref_px") is not None:
-                t.append(r["t"]); joints.append(r["joints"]); tags.append(r["tags"])
-    return np.array(t), joints, tags
+                q = dict(r["joints"])
+                for t_write, sh in shifts:
+                    if r["t"] < t_write:
+                        for n, d in sh.items():
+                            if n in q:
+                                q[n] += d
+                t.append(r["t"]); joints.append(q); tags.append(r["tags"])
+    order = np.argsort(t)
+    return np.array(t)[order], [joints[k] for k in order], [tags[k] for k in order]
 
 
 def still_poses(side, t, joints, tags, still_deg, still_s, min_frames, outlier_mm):
-    """One averaged pose per still moment of this arm: (q rad (5,), {tag: mm (3,)})."""
+    """One averaged pose per still moment of this arm: (q rad (5,), {tag: mm (3,)}, meta).
+
+    ``meta["dir"]`` is each joint's approach direction into the pose (+1/-1, 0 if it hadn't
+    moved): the sign of its last change of more than 0.3 deg before the pose. It's what the
+    backlash term needs, because the encoders sit on the motor side of the gearbox.
+    """
     names = [f"{side}_{j}_joint" for j in JOINTS]
     Q = np.array([[j[n] for n in names] for j in joints])
     k0 = 0
@@ -85,12 +107,21 @@ def still_poses(side, t, joints, tags, still_deg, still_s, min_frames, outlier_m
             if len(P) >= min_frames:
                 obs[tag] = (P.mean(0), P.std(0), len(P))
         if obs:
-            poses.append((Q[seg].mean(0), obs, len(seg)))
-    # Merge repeats of the same pose (the arm sitting at rest across several segments).
+            q_mean = Q[seg].mean(0)
+            dirs = np.zeros(len(JOINTS))
+            for j in range(len(JOINTS)):
+                for k in range(seg[0] - 1, -1, -1):
+                    if abs(np.degrees(q_mean[j] - Q[k, j])) > 0.3:
+                        dirs[j] = np.sign(q_mean[j] - Q[k, j])
+                        break
+            poses.append((q_mean, obs, {"n": len(seg), "dir": dirs}))
+    # Merge repeats of the same pose (the arm sitting at rest across several segments), but
+    # never two approaches from different directions: that difference is the backlash.
     merged = []
-    for q, obs, n in sorted(poses, key=lambda p: -p[2]):
-        if all(np.degrees(np.abs(q - m[0])).max() > 1.0 for m in merged):
-            merged.append((q, obs, n))
+    for q, obs, meta in sorted(poses, key=lambda p: -p[2]["n"]):
+        if all(np.degrees(np.abs(q - m[0])).max() > 1.0 or not np.array_equal(meta["dir"], m[2]["dir"])
+               for m in merged):
+            merged.append((q, obs, meta))
     return merged
 
 
@@ -142,6 +173,7 @@ class ArmModel:
         if getattr(self, "_idx_key", None) != key:
             self._idx_key = key
             self._Q = np.array([q for q, _, _ in poses])
+            self._D = np.array([m["dir"] for _, _, m in poses])
             self._obs = [(k, tag, p) for k, (_, obs, _) in enumerate(poses) for tag, (p, _, _) in obs.items()]
             self._obs_pose = np.array([k for k, _, _ in self._obs])
             self._obs_link = np.array([TAG_LINK[tag] for _, tag, _ in self._obs])
@@ -240,20 +272,24 @@ def report(model, x, J, poses):
 
 SIDES = ("left", "right")
 N_ARM = 9 + 3          # 3 tag points + roll/yaw/elbow zero
+N_BACKLASH = 4         # pitch, roll, yaw, elbow (the wrist barely moves a tag)
 
 
 class StationMap:
     """Both arms on one base. ``x`` = base (6) | left (12) | right (12) | right pitch zero |
     [coupling left, right]."""
 
-    def __init__(self, poses: dict, pitch_sign=(1.0, 1.0), roll_seed=(0.0, 0.0), coupling=False):
+    def __init__(self, poses: dict, pitch_sign=(1.0, 1.0), roll_seed=(0.0, 0.0), coupling=False,
+                 backlash=False):
         self.poses = poses
         self.arms = {s: ArmModel(s) for s in SIDES}
         for s, sign in zip(SIDES, pitch_sign):
             self.arms[s].chain.frame_sign = np.array([sign, 1, 1, 1, 1.0])
         self.roll_seed = dict(zip(SIDES, roll_seed))
         self.coupling = coupling
-        self.n = 6 + 2 * N_ARM + 1 + (2 if coupling else 0)
+        self.backlash = backlash
+        self._k_back = 6 + 2 * N_ARM + 1 + (2 if coupling else 0)
+        self.n = self._k_back + (2 * N_BACKLASH if backlash else 0)
 
     def arm_params(self, x, side):
         k = 6 + (0 if side == "left" else N_ARM)
@@ -266,12 +302,23 @@ class StationMap:
         c = x[6 + 2 * N_ARM + 1 + SIDES.index(side)] if self.coupling else 0.0
         return on, dq, c
 
-    def joint_angles(self, side, Q, x):
-        """Encoder angles (N,5) -> the URDF-frame angles the fitted model uses."""
+    def backlash_of(self, x, side):
+        """Half-backlash per joint (rad), URDF frame; the wrist's isn't observable."""
+        b = np.zeros(5)
+        if self.backlash:
+            k = self._k_back + N_BACKLASH * SIDES.index(side)
+            b[:N_BACKLASH] = x[k:k + N_BACKLASH]
+        return b
+
+    def joint_angles(self, side, Q, x, D=None):
+        """Encoder angles (N,5) -> the URDF-frame angles the fitted model uses. ``D`` is each
+        pose's approach direction per joint (device frame), for the backlash term."""
         arm = self.arms[side]
         on, dq, c = self.arm_params(x, side)
         q = arm.chain.device_to_urdf(np.atleast_2d(Q)).copy()
         q[:, 1] += c * q[:, 0]
+        if self.backlash and D is not None:
+            q += arm.chain.device_to_urdf(np.atleast_2d(D)) * self.backlash_of(x, side)
         return q + dq
 
     def residuals(self, x):
@@ -281,7 +328,7 @@ class StationMap:
             arm = self.arms[side]
             arm._index(self.poses[side])
             on, _, _ = self.arm_params(x, side)
-            F = arm.frames_batch(self.joint_angles(side, arm._Q, x))
+            F = arm.frames_batch(self.joint_angles(side, arm._Q, x, arm._D))
             Fo = F[arm._obs_link, arm._obs_pose]
             off = np.array([on[g] for g in arm._obs_tag])
             local = np.einsum("mij,mj->mi", Fo[:, :3, :3], off) + Fo[:, :3, 3]
@@ -322,6 +369,7 @@ class StationMap:
                 "frame_sign": self.arms[side].chain.frame_sign.tolist(),
                 "zero_offset_rad": dq.tolist(), "zero_offset_sd_rad": sdq.tolist(),
                 "pitch_roll_coupling": float(c),
+                "half_backlash_rad": self.backlash_of(x, side).tolist(),
                 "tag_on_link_m": {tag: p.tolist() for tag, p in on.items()},
                 "tag_link": dict(TAG_LINK)}
         return out
@@ -366,17 +414,17 @@ class LoadedMap:
         return np.array([tf(p) for p in joints]), {k: tf(v) for k, v in tags.items()}
 
 
-def fit_station(poses, coupling=False):
+def fit_station(poses, coupling=False, backlash=False, signs=None):
     """Try both pitch directions per arm and both roll starts; return the best fit."""
     import itertools
     best = None
-    for signs in itertools.product((1.0, -1.0), repeat=2):
+    for sg in ([signs] if signs else itertools.product((1.0, -1.0), repeat=2)):
         for seeds in itertools.product((0.0, np.pi), repeat=2):
-            m = StationMap(poses, signs, seeds, coupling)
+            m = StationMap(poses, sg, seeds, coupling, backlash)
             x, J = levenberg_marquardt(m.residuals, m.initial_guess(), iters=250)
             r = m.residuals(x)
             rms = float(np.sqrt((r.reshape(-1, 3) ** 2).sum(1).mean()))
-            print(f"  pitch signs {tuple(int(v) for v in signs)}, roll start "
+            print(f"  pitch signs {tuple(int(v) for v in sg)}, roll start "
                   f"{tuple(int(np.degrees(v)) for v in seeds)}: RMS {rms:7.2f} mm")
             if best is None or rms < best[0]:
                 best = (rms, m, x, J, r)
@@ -401,6 +449,12 @@ def report_station(m, x, r):
         names = ["pitch (vs left)" if side == "right" else None, "roll", "yaw", "elbow"]
         offs = [f"{nm} {((np.degrees(dq[j]) + 180) % 360) - 180:+.2f}" for j, nm in enumerate(names) if nm]
         print("  zero offsets (deg): " + ", ".join(offs) + (f"; coupling c {c:+.4f}" if m.coupling else ""))
+        if m.backlash:
+            b = np.degrees(m.backlash_of(x, side))
+            print("  half-backlash (deg): " + ", ".join(f"{JOINTS[j]} {b[j]:+.2f}" for j in range(N_BACKLASH)))
+            dirs = np.array([meta["dir"] for _, _, meta in m.poses[side]])
+            print("  poses approached from each side (+/-): " + ", ".join(
+                f"{JOINTS[j]} {int((dirs[:, j] > 0).sum())}/{int((dirs[:, j] < 0).sum())}" for j in range(N_BACKLASH)))
         print("  tags from their joint (mm): " +
               ", ".join(f"{tag} {np.linalg.norm(p) * 1000:.0f}" for tag, p in on.items()))
 
@@ -413,17 +467,23 @@ def main() -> int:
     ap.add_argument("--min-frames", type=int, default=5)
     ap.add_argument("--outlier-mm", type=float, default=3.0)
     ap.add_argument("--coupling", action="store_true", help="also fit pitch-to-roll coupling")
+    ap.add_argument("--backlash", action="store_true", help="also fit half-backlash per joint")
+    ap.add_argument("--known-signs", action="store_true",
+                    help="skip the pitch-direction search: both reversed (core c72dcc3)")
+    ap.add_argument("--zero-record", action="append", default=[], metavar="runs/zero_*.json",
+                    help="offset write between runs: earlier frames get its shifts")
     ap.add_argument("--out", help="write the fitted map as JSON (for view_map.py)")
     a = ap.parse_args()
 
-    t, joints, tags = load_frames(a.runs)
+    t, joints, tags = load_frames(a.runs, a.zero_record)
     poses = {side: still_poses(side, t, joints, tags, a.still_deg, a.still_s, a.min_frames, a.outlier_mm)
              for side in SIDES}
     for side in SIDES:
         if len(poses[side]) < 6:
             sys.exit(f"{side}: only {len(poses[side])} still poses, not enough to fit")
     print("fitting both arms on one base:")
-    rms, m, x, J, r = fit_station(poses, coupling=a.coupling)
+    rms, m, x, J, r = fit_station(poses, coupling=a.coupling, backlash=a.backlash,
+                                  signs=(-1.0, -1.0) if a.known_signs else None)
     report_station(m, x, r)
     if a.out:
         d = m.to_json(x, J, r)

@@ -42,9 +42,9 @@
       ],
       "zero_offset_rad": [
         0.0,
-        -0.03131472408918561,
-        -0.03534479140943343,
-        -0.01663118769392919,
+        -6.938893903907228e-18,
+        0.0,
+        0.0,
         0.0
       ],
       "zero_offset_sd_rad": [
@@ -94,10 +94,10 @@
         1.0
       ],
       "zero_offset_rad": [
-        0.062930576554135,
-        -0.011888666902664543,
-        -0.06886204763259272,
-        -0.05395480241950693,
+        0.0,
+        -1.734723475976807e-18,
+        0.0,
+        -6.938893903907228e-18,
         0.0
       ],
       "zero_offset_sd_rad": [
@@ -134,5 +134,6 @@
   },
   "runs": [
     "runs/map_20261019T182231.jsonl"
-  ]
+  ],
+  "note": "Zero offsets for roll/yaw/elbow (both arms) and right pitch were written to the ESCs on 2026-10-19 19:05 (runs/zero_20261019T190557.json), so they are folded out of this map. Valid until the next power cycle or T-pose re-zero; base and tag points stay valid."
 }
