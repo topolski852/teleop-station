@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Repeatability run: cycle the arms through taught poses and measure every stop.
 
-    python scripts/run_repeatability.py --poses runs/poses_demo.json --dry-run   # moves nothing
-    sudo systemctl stop humanoid-web                                              # then, for real:
-    python scripts/run_repeatability.py --poses runs/poses_demo.json --cycles 50
+    python scripts/run_repeatability.py --path runs/path_raw_demo.planned.json --dry-run   # moves nothing
+    sudo systemctl stop humanoid-web                                                        # then, for real:
+    python scripts/run_repeatability.py --path runs/path_raw_demo.planned.json --cycles 50
+
+**--path**: a path taught by hand (``record_path.py``, then ``edit_path.py``). Each cycle replays
+it and stops at every pause in the recording; the same path every time means every stop is
+reached from the same side. It starts and ends at the path's first stop, so record it from
+rest. **--poses**: poses taught one at a time (``teach_poses.py``), as below.
 
 Each cycle visits every pose (left pose i and right pose i together, or one arm with
 ``--arms``). Every pose is approached the same way: a synchronised minimum-jerk move to a
@@ -134,15 +139,34 @@ class Camera:
         self.cap.release()
 
 
+def build_path_program(path_file, arms, vmax, amax, limits):
+    """A taught path (edit_path.py) as runner steps: each segment ends at a stop, measured there.
+    The path's first stop is also where the run starts and ends (record it at rest)."""
+    from teleop_station.motion import PlannedPath, Trajectory
+    plan = PlannedPath.load(path_file)
+    keep = [i for i, n in enumerate(plan.names) if n.split("_")[0] in arms]
+    names = [plan.names[i] for i in keep]
+    stops = [np.asarray(q)[keep] for q in plan.stops]
+    segs = [Trajectory(names, s.t, s.q[:, keep]) for s in plan.segments]
+    labels = [f"S{k + 1}" for k in range(len(stops))]
+    steps = [(seg, labels[(k + 1) % len(stops)], stops[(k + 1) % len(stops)]) for k, seg in enumerate(segs)]
+    problems = [p for p in plan.problems if not p.startswith("NOTE")]
+    for k, seg in enumerate(segs):
+        problems.extend(f"segment {k + 1}: {p}" for p in limits.check(seg, vmax, amax))
+    return names, stops[0], list(zip(labels, stops)), steps, problems, plan
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--poses", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--poses", help="taught poses (teach_poses.py)")
+    src.add_argument("--path", help="taught and planned path (record_path.py, then edit_path.py)")
     ap.add_argument("--cycles", type=int, default=50)
     ap.add_argument("--arms", default="both", choices=("both", "left", "right"))
-    ap.add_argument("--vmax", type=float, default=15.0, help="deg/s per joint")
+    ap.add_argument("--vmax", type=float, default=15.0, help="deg/s per joint (a path keeps its own timing)")
     ap.add_argument("--amax", type=float, default=60.0, help="deg/s^2 per joint")
-    ap.add_argument("--approach", type=float, default=3.0, help="deg beyond each pose, then in")
-    ap.add_argument("--final-vmax", type=float, default=5.0, help="deg/s for the final approach")
+    ap.add_argument("--approach", type=float, default=3.0, help="poses: deg beyond each pose, then in")
+    ap.add_argument("--final-vmax", type=float, default=5.0, help="poses: deg/s for the final approach")
     ap.add_argument("--settle", type=float, default=1.0, help="extra seconds after settling")
     ap.add_argument("--shots", type=int, default=5)
     ap.add_argument("--camera", default="gphoto2:runs/shots_rep_{time}", help="camera source")
@@ -152,30 +176,47 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="plan, check, simulate one cycle; send nothing")
     ap.add_argument("--limits", default="soft", choices=("soft", "hard"),
                     help="soft: the URDF's range (teleop's); hard: the ESC firmware's wider range")
+    ap.add_argument("--max-start-deg", type=float, default=15.0,
+                    help="path: refuse if the arms are further than this from the path's first stop")
     ap.add_argument("--config", default=DAEMON_CONFIG)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
     stamp = time.strftime("%Y%m%dT%H%M%S")
-    poses = json.loads(Path(a.poses).read_text())
-    if not poses.get("rest"):
-        sys.exit("the poses file has no rest pose (teach_poses.py: 'rest')")
     arms = ["left", "right"] if a.arms == "both" else [a.arms]
     limits = JointLimits.for_arms(a.config, arms=[f"{s}_arm" for s in arms], tier=a.limits)
     vmax, amax, final_vmax, approach = a.vmax * DEG, a.amax * DEG, a.final_vmax * DEG, a.approach * DEG
-    names, rest, stops, first, cycle, wrap, home, problems = build_program(
-        poses, arms, approach, vmax, amax, final_vmax, limits)
-
-    move_t = first.duration + sum(t.duration for t in cycle)
     per_stop = 2.0 + a.settle + (0 if a.no_camera else a.shots * 2.1)
-    cycle_t = sum(t.duration for t in cycle) + wrap.duration + len(stops) * per_stop
-    print(f"program: {len(stops)} stops per cycle ({', '.join(s[0] for s in stops)}), arms {arms}")
-    print(f"  moves {vmax / DEG:.0f} deg/s, final approach {a.approach:.0f} deg at {a.final_vmax:.0f} deg/s")
-    for label, target, d in stops:
-        print(f"  {label:8s} " + "  ".join(f"{n.replace('_joint', '').replace('shoulder_', 'sh_')} {v / DEG:+6.1f}"
-                                         f"{'+' if dd > 0 else '-'}" for n, v, dd in zip(names, target, d)))
-    print(f"  one cycle ~{cycle_t / 60:.1f} min (moves {move_t:.0f} s + {per_stop:.0f} s per stop); "
-          f"{a.cycles} cycles ~{(first.duration + a.cycles * cycle_t + home.duration) / 60:.0f} min")
+
+    if a.poses:
+        poses = json.loads(Path(a.poses).read_text())
+        if not poses.get("rest"):
+            sys.exit("the poses file has no rest pose (teach_poses.py: 'rest')")
+        names, rest, pstops, first, cycle, wrap, home, problems = build_program(
+            poses, arms, approach, vmax, amax, final_vmax, limits)
+        stops = [(l, t) for l, t, _ in pstops]
+        first_move = lambda q0: approach_move(names, q0, pstops[0][1], approach, pstops[0][2], vmax, amax, final_vmax)
+        first_measure = stops[0]
+        steps_first = [(cycle[k - 1], l, t) for k, (l, t) in enumerate(stops) if k > 0]
+        steps = [(wrap, *stops[0])] + steps_first
+        print(f"program: {len(stops)} poses per cycle ({', '.join(l for l, _ in stops)}), arms {arms}")
+        print(f"  moves {vmax / DEG:.0f} deg/s, final approach {a.approach:.0f} deg at {a.final_vmax:.0f} deg/s")
+        for label, target, d in pstops:
+            print(f"  {label:8s} " + "  ".join(f"{n.replace('_joint', '').replace('shoulder_', 'sh_')} {v / DEG:+6.1f}"
+                                             f"{'+' if dd > 0 else '-'}" for n, v, dd in zip(names, target, d)))
+    else:
+        names, rest, stops, steps, problems, plan = build_path_program(a.path, arms, vmax, amax, limits)
+        first_move = lambda q0: movej(names, q0, rest, vmax, amax)
+        first_measure = None
+        steps_first = steps
+        print(f"program: taught path {a.path}: {len(stops)} stops, {len(steps)} moves per cycle, arms {arms}"
+              + ("" if not plan.closes_loop else "  (the closing move back to S1 was planned, not recorded)"))
+        for label, target in stops:
+            print(f"  {label:4s} " + "  ".join(f"{n.replace('_joint', '').replace('shoulder_', 'sh_')} {v / DEG:+6.1f}"
+                                         for n, v in zip(names, target)))
+    cycle_t = sum(tr.duration for tr, _, _ in steps) + len(steps) * per_stop
+    print(f"  one cycle ~{cycle_t / 60:.1f} min ({sum(tr.duration for tr, _, _ in steps):.0f} s moving + "
+          f"{per_stop:.0f} s per stop); {a.cycles} cycles ~{a.cycles * cycle_t / 60:.0f} min")
     if problems:
         print("\nREJECTED, nothing was enabled:\n  " + "\n  ".join(problems))
         return 1
@@ -204,8 +245,8 @@ def main() -> int:
         cycles = a.cycles
 
     out.write(json.dumps({"kind": "header", "started": stamp, "dry_run": a.dry_run, "args": vars(a),
-                          "names": names, "rest": rest.tolist(),
-                          "stops": [{"label": l, "target": t.tolist(), "direction": d.tolist()} for l, t, d in stops],
+                          "mode": "poses" if a.poses else "path", "names": names, "rest": rest.tolist(),
+                          "stops": [{"label": l, "target": t.tolist()} for l, t in stops],
                           "limits": {n: [limits.lower[n], limits.upper[n]] for n in names},
                           "camera_layout": cam.layout_json if cam else None}) + "\n")
     ex = Executor(bus, names, limits, log=log)
@@ -221,7 +262,7 @@ def main() -> int:
             raise KeyboardInterrupt
     signal.signal(signal.SIGINT, on_sigint)
 
-    def measure(cycle_i, k, label, target, settle):
+    def measure(cycle_i, label, target, settle):
         enc = []
         def sample():
             s = bus.read(names); enc.append([s[n].position for n in names])
@@ -233,7 +274,7 @@ def main() -> int:
         if not enc:
             sample()
         E = np.array(enc)
-        rec = {"kind": "stop", "t": round(time.time(), 3), "cycle": cycle_i, "stop": k, "label": label,
+        rec = {"kind": "stop", "t": round(time.time(), 3), "cycle": cycle_i, "label": label,
                "commanded": target.tolist(), "encoder_mean": E.mean(0).tolist(), "encoder_std": E.std(0).tolist(),
                "settle": settle, "camera": cam_r}
         out.write(json.dumps(rec) + "\n"); out.flush()
@@ -245,19 +286,25 @@ def main() -> int:
     status = "ok"
     try:
         q0 = ex.enable()
-        start = approach_move(names, q0, stops[0][1], approach, stops[0][2], vmax, amax, final_vmax)
+        far = np.degrees(np.abs(q0 - rest)).max()
+        if a.path and far > a.max_start_deg:
+            raise MotionAborted(f"the arms are {far:.0f} deg from the path's first stop (max {a.max_start_deg:.0f}); "
+                                f"put them where the recording started")
+        ex.run(first_move(q0), vmax, amax)
+        if first_measure:
+            measure(0, *first_measure, ex.settle())
         for c in range(cycles):
-            for k, (label, target, d) in enumerate(stops):
-                tr = start if (c == 0 and k == 0) else (wrap if k == 0 else cycle[k - 1])
+            for tr, label, target in (steps_first if c == 0 else steps):
                 ex.run(tr, vmax, amax)
-                measure(c, k, label, target, ex.settle())
-        ex.run(movej(names, ex.last_target, rest, vmax, amax), vmax, amax)
-        ex.settle()
+                measure(c, label, target, ex.settle())
+        if np.abs(ex.last_target - rest).max() > 1e-6:
+            ex.run(movej(names, ex.last_target, rest, vmax, amax), vmax, amax)
+            ex.settle()
         ex.release()
     except MotionStopped:
         status = "stopped"
         signal.signal(signal.SIGINT, lambda *_: (ex.estop("Ctrl-C at the prompt"), sys.exit(1)))
-        ans = input("Stopped and holding. [r] return to rest slowly and release, anything else = E-stop: ").strip()
+        ans = input("Stopped and holding. [r] return to the start slowly and release, anything else = E-stop: ").strip()
         if ans == "r":
             ex.run(movej(names, ex.last_target, rest, vmax / 2, amax), vmax, amax)
             ex.settle()
@@ -266,6 +313,8 @@ def main() -> int:
             ex.estop("operator chose E-stop after a stop")
     except MotionAborted as e:
         status = f"aborted: {e}"
+        if not ex.estopped and ex.enabled:
+            ex.estop(str(e))
     except KeyboardInterrupt:
         status = "E-stopped (second Ctrl-C)"
     except BaseException as e:

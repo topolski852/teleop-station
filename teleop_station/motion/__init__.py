@@ -14,10 +14,12 @@ the same form and go through the same checks and executor.
 from .bus import DaemonBus, JointBus, JointSample, SimBus
 from .executor import Executor, MotionAborted, MotionStopped
 from .limits import JointLimits
+from .path import PlannedPath, RawPath, find_dwells, plan_path
 from .trajectory import Trajectory, approach_move, movej
 
 __all__ = [
     "DaemonBus", "JointBus", "JointSample", "SimBus",
     "Executor", "MotionAborted", "MotionStopped",
     "JointLimits", "Trajectory", "approach_move", "movej",
+    "PlannedPath", "RawPath", "find_dwells", "plan_path",
 ]
