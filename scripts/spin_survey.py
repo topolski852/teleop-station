@@ -179,7 +179,7 @@ def main() -> int:
         raise
     finally:
         if cam is not None:
-            cam.close()
+            cam.release()
         bus.close()
         print(f"run ended: {status}")
     if not sightings:
