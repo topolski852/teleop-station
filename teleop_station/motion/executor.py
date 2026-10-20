@@ -184,7 +184,8 @@ class Executor:
             self._check(s, self.last_target, vel[max(0, k - 1)])
             if self.on_tick:
                 self.on_tick(time.monotonic(), self.last_target, np.array([s[n].position for n in self.names]),
-                             np.array([s[n].torque for n in self.names]))
+                             np.array([s[n].torque for n in self.names]),
+                             np.array([s[n].bus_voltage for n in self.names]))
             self.bus.send(dict(zip(self.names, target)))
             self.last_target = target
             if k == len(traj.t) - 1:

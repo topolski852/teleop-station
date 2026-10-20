@@ -52,6 +52,8 @@ def main() -> int:
     ap.add_argument("--still-deg", type=float, default=0.5, help="every joint within this = still")
     ap.add_argument("--limits", default="hard", choices=("soft", "hard"),
                     help="warn when a joint leaves this range: the motors won't follow it there")
+    ap.add_argument("--warn-pitch", type=float, default=65.0,
+                    help="warn when a shoulder pitch goes past this many degrees from hanging")
     ap.add_argument("--config", default=DAEMON_CONFIG)
     a = ap.parse_args()
 
@@ -65,6 +67,14 @@ def main() -> int:
         if enabled:
             print("joints are ENABLED (someone is commanding them); not recording:", enabled)
             return 1
+        damped = [n.replace("_joint", "") for n in names if s[n].state == "DAMPING"]
+        if damped:
+            # After an E-stop the joints are DAMPING: they resist being guided by hand.
+            print("joints are DAMPING (resist being moved):", damped)
+            if input("Switch every joint to IDLE (limp) for guiding by hand? Arms resting on the table? [y/N] ").strip().lower() == "y":
+                bus.wake()
+                time.sleep(0.5)
+                s = bus.read(names)
         asleep = {n: x.state for n, x in s.items() if x.state not in LIVE}
         if asleep:
             print("joints not awake:", {n.replace("_joint", ""): st for n, st in asleep.items()})
@@ -88,6 +98,8 @@ def main() -> int:
         t0 = time.monotonic()
         pauses, in_pause, last_show = 0, False, 0.0
         over: set[str] = set()
+        pitch_high: set[str] = set()
+        pitch_cols = [j for j, n in enumerate(names) if n.endswith("shoulder_pitch_joint")]
         n_win = int(a.pause_s * a.hz)
         try:
             while not done.is_set():
@@ -105,10 +117,14 @@ def main() -> int:
                         pauses += 1
                     in_pause = still
                 out = [names[j].replace("_joint", "") for j in np.where((np.array(q[-1]) < lo) | (np.array(q[-1]) > hi))[0]]
+                high = [names[j].replace("_joint", "") for j in pitch_cols if abs(np.degrees(q[-1][j])) > a.warn_pitch]
+                if high:
+                    pitch_high.update(high)
                 if out:
                     over.update(out)
                 if tick - last_show > 0.3:
                     warn = f"  PAST LIMIT: {', '.join(out)}" if out else ""
+                    warn += f"  HIGH PITCH (> {a.warn_pitch:.0f}): {', '.join(high)}" if high else ""
                     print(f"\r  {t[-1]:6.1f} s  {'PAUSE (counts as a stop)' if in_pause else 'moving                 '}"
                           f"  stops so far: {pauses}{warn}".ljust(150), end="", flush=True)
                     last_show = tick
@@ -125,6 +141,9 @@ def main() -> int:
     raw.save(a.out)
     print(f"wrote {a.out}: {t[-1]:.0f} s, {len(t)} samples, ~{pauses} pauses. "
           f"Next: python scripts/edit_path.py {a.out}")
+    if pitch_high:
+        print(f"NOTE: {sorted(pitch_high)} went past {a.warn_pitch:.0f} deg; under the motors the left "
+              f"shoulder stopped at ~69 deg with the arm extended (2026-10-20).")
     if over:
         print(f"WARNING: went past the {a.limits} limits on {sorted(over)}: the motors won't follow there, "
               f"so that part can't be replayed. Re-record staying inside.")

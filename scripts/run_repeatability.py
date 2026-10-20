@@ -274,16 +274,20 @@ def main() -> int:
     except Exception:
         pass
     max_tau = np.zeros(len(names))
-    def on_tick(t, cmd, meas, tau):
+    min_volt = np.full(len(names), np.inf)
+    def on_tick(t, cmd, meas, tau, volt):
         # Tracking and torque, 10 times a second: how far each joint trails its command, and how
         # much of its torque limit it's using, through the moves.
         ticks["n"] += 1
         good = np.isfinite(tau)
         max_tau[good] = np.maximum(max_tau[good], np.abs(tau[good]))
+        gv = np.isfinite(volt)
+        min_volt[gv] = np.minimum(min_volt[gv], volt[gv])
         if ticks["n"] % 5 == 0:
             out.write(json.dumps({"kind": "track", "t": round(time.time(), 3),
                                   "cmd": np.round(cmd, 5).tolist(), "meas": np.round(meas, 5).tolist(),
-                                  "tau": [None if not np.isfinite(v) else round(float(v), 3) for v in tau]}) + "\n")
+                                  "tau": [None if not np.isfinite(v) else round(float(v), 3) for v in tau],
+                                  "volt": [None if not np.isfinite(v) else round(float(v), 2) for v in volt]}) + "\n")
     ex = Executor(bus, names, limits, log=log, on_tick=on_tick)
 
     presses = {"n": 0}
@@ -365,6 +369,8 @@ def main() -> int:
             f"{n.replace('_joint', '')} {np.degrees(v):.1f}" for n, v in zip(names, ex.max_track)))
         log("largest measured torque per joint (Nm, of its limit): " + ", ".join(
             f"{n.replace('_joint', '')} {v:.2f}/{torque_limit.get(n, float('nan')):.0f}" for n, v in zip(names, max_tau)))
+        log("lowest bus voltage seen per joint (V): " + ", ".join(
+            f"{n.replace('_joint', '')} {v:.1f}" for n, v in zip(names, min_volt) if np.isfinite(v)))
         log(f"run ended: {status}")
         out.close()
         if cam:
