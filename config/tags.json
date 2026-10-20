@@ -2,27 +2,27 @@
   "family": "25h9",
   "tags": {
     "0": {
-      "name": "right_hand",
+      "name": "right_forearm_b",
       "size_m": 0.0367
     },
     "1": {
-      "name": "right_wrist",
+      "name": "right_forearm_a",
       "size_m": 0.0367
     },
     "2": {
-      "name": "right_shoulder_roll",
+      "name": "right_shoulder_roll_tag",
       "size_m": 0.0367
     },
     "3": {
-      "name": "left_hand",
+      "name": "left_forearm_b",
       "size_m": 0.0367
     },
     "4": {
-      "name": "left_wrist",
+      "name": "left_forearm_a",
       "size_m": 0.0367
     },
     "5": {
-      "name": "left_shoulder_roll",
+      "name": "left_shoulder_roll_tag",
       "size_m": 0.0367
     },
     "6": {
@@ -40,6 +40,46 @@
     "9": {
       "name": "table_near_right",
       "size_m": 0.0367
+    },
+    "10": {
+      "name": "right_cube_10",
+      "size_m": 0.0367
+    },
+    "11": {
+      "name": "right_cube_11",
+      "size_m": 0.0367
+    },
+    "12": {
+      "name": "right_cube_12",
+      "size_m": 0.0367
+    },
+    "13": {
+      "name": "right_cube_13",
+      "size_m": 0.0367
+    },
+    "14": {
+      "name": "right_cube_14",
+      "size_m": 0.0367
+    },
+    "15": {
+      "name": "left_cube_15",
+      "size_m": 0.0367
+    },
+    "16": {
+      "name": "left_cube_16",
+      "size_m": 0.0367
+    },
+    "17": {
+      "name": "left_cube_17",
+      "size_m": 0.0367
+    },
+    "18": {
+      "name": "left_cube_18",
+      "size_m": 0.0367
+    },
+    "19": {
+      "name": "left_cube_19",
+      "size_m": 0.0367
     }
   },
   "reference": [
@@ -48,5 +88,35 @@
     6,
     7
   ],
-  "note": "Black-square edge 36.7 mm on all tags (calipered 2026-10-19). Reference = the tags that stay still during a test (table 8, 9; torso 6, 7); the first is the anchor."
+  "bodies": {
+    "right_hand": [
+      10,
+      11,
+      12,
+      13,
+      14
+    ],
+    "left_hand": [
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    "right_wrist": [
+      1,
+      0
+    ],
+    "left_wrist": [
+      4,
+      3
+    ],
+    "right_shoulder_roll": [
+      2
+    ],
+    "left_shoulder_roll": [
+      5
+    ]
+  },
+  "note": "All black squares 36.7 mm (one print run). Hand cubes: 50 mm faces, 10-14 right, 15-19 left (tag centring on each face is surveyed, not assumed). Forearms: 1+0 right, 4+3 left (0 and 3 moved there from the hands on 2026-10-20). Bodies are fitted as rigid targets; their first id is the anchor. Reference = table 8, 9 and torso 6, 7."
 }

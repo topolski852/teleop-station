@@ -12,9 +12,11 @@ tags so a bumped tripod moves the camera, not the numbers.
 - ``tags``: the station's tag set, detection, the reference-frame fit, and averaging over a stop.
 """
 from .calib import CameraCalibration, charuco_board
-from .tags import DEFAULT_TAGS, Pose, ReferenceFit, Sighting, TagSet, TagTracker, mean_pose, survey
+from .tags import (DEFAULT_TAGS, Pose, ReferenceFit, Sighting, TagSet, TagTracker, load_body_layout,
+                   mean_pose, save_body_layout, survey, survey_body)
 
 __all__ = [
     "CameraCalibration", "charuco_board",
-    "DEFAULT_TAGS", "Pose", "ReferenceFit", "Sighting", "TagSet", "TagTracker", "mean_pose", "survey",
+    "DEFAULT_TAGS", "Pose", "ReferenceFit", "Sighting", "TagSet", "TagTracker", "load_body_layout",
+    "mean_pose", "save_body_layout", "survey", "survey_body",
 ]

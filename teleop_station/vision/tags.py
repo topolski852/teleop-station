@@ -86,6 +86,13 @@ class TagSet:
     # Per setup, so it is stored separately (scripts/track_tags.py --layout), not by ``save``.
     layout: dict[int, Pose] = field(default_factory=dict)
     note: str = ""
+    # Rigid bodies: several tags on one part (the hand cube, a forearm's two faces), fitted
+    # together as one target. The first id is the anchor: the body's frame is that tag's frame.
+    # A body is reported under its own name in place of its tags'.
+    bodies: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    # Surveyed pose of each tag of a body in the body's (anchor's) frame (``survey_body``).
+    # Fixed by how the part was built, so it survives setups; stored in body_layout.json.
+    body_layout: dict[str, dict[int, Pose]] = field(default_factory=dict)
 
     @property
     def anchor(self) -> int:
@@ -103,6 +110,7 @@ class TagSet:
             "family": self.family,
             "tags": {str(i): {"name": self.names[i], "size_m": self.sizes_m[i]} for i in sorted(self.names)},
             "reference": list(self.reference),
+            "bodies": {k: list(v) for k, v in self.bodies.items()},
             "note": self.note,
         }, indent=2) + "\n")
 
@@ -110,9 +118,29 @@ class TagSet:
     def load(cls, path: str | Path) -> "TagSet":
         d = json.loads(Path(path).read_text())
         tags = {int(i): v for i, v in d["tags"].items()}
+        bodies = {k: tuple(v) for k, v in d.get("bodies", {}).items()}
+        # A body's layout lives beside the tag file (body_layout.json), surveyed once per build.
+        bl_path = Path(path).with_name("body_layout.json")
+        body_layout = load_body_layout(bl_path) if bl_path.exists() else {}
         return cls(family=d["family"], names={i: v["name"] for i, v in tags.items()},
                    sizes_m={i: float(v["size_m"]) for i, v in tags.items()},
-                   reference=tuple(d["reference"]), note=d.get("note", ""))
+                   reference=tuple(d["reference"]), note=d.get("note", ""),
+                   bodies=bodies, body_layout=body_layout)
+
+    def body_of(self, tag_id: int) -> str | None:
+        return next((b for b, ids in self.bodies.items() if tag_id in ids), None)
+
+
+def load_body_layout(path) -> dict[str, dict[int, Pose]]:
+    d = json.loads(Path(path).read_text())
+    return {b: {int(i): Pose.from_json(p) for i, p in v.items()} for b, v in d["bodies"].items()}
+
+
+def save_body_layout(path, layout: dict[str, dict[int, Pose]], info: dict | None = None) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps({"bodies": {b: {str(i): p.to_json() for i, p in sorted(v.items())}
+                                                for b, v in layout.items()}, "info": info or {}},
+                                     indent=2) + "\n")
 
 
 DEFAULT_TAGS = TagSet()
@@ -187,18 +215,31 @@ class TagTracker:
 
         A reference tag other than the anchor only counts once the layout has been surveyed.
         """
-        usable = [i for i in self.tags.reference if i in seen and self._ref_from_tag(i) is not None]
+        return self._rigid_fit(seen, self.tags.reference, self._ref_from_tag)
+
+    def fit_body(self, seen: dict[int, Sighting], body: str) -> ReferenceFit | None:
+        """A body's frame (its anchor tag's) in the camera, from whichever of its tags are
+        visible. Without a surveyed layout only the anchor tag itself can be used."""
+        ids = self.tags.bodies[body]
+        lay = self.tags.body_layout.get(body, {})
+        def from_tag(i):
+            return Pose(np.eye(3), np.zeros(3)) if i == ids[0] else lay.get(i)
+        return self._rigid_fit(seen, ids, from_tag)
+
+    def _rigid_fit(self, seen, ids, frame_from_tag) -> ReferenceFit | None:
+        """One PnP over every corner of every visible tag of a rigid group."""
+        usable = [i for i in ids if i in seen and frame_from_tag(i) is not None]
         if not usable:
             return None
         obj, img = [], []
         for i in usable:
-            p = self._ref_from_tag(i)
+            p = frame_from_tag(i)
             obj.append((p.R @ _tag_object_points(self.tags.sizes_m[i]).T).T + p.t)
             img.append(seen[i].corners)
         obj, img = np.vstack(obj).astype(np.float64), np.vstack(img).astype(np.float64)
         # Start from the best-seen tag's own pose, then refine on all corners together.
         first = max(usable, key=lambda i: seen[i].side_px)
-        guess = seen[first].pose @ self._ref_from_tag(first).inverse()
+        guess = seen[first].pose @ frame_from_tag(first).inverse()
         rvec, tvec = cv2.Rodrigues(guess.R)[0], guess.t.reshape(3, 1).copy()
         if len(usable) > 1:
             ok, rvec, tvec = cv2.solvePnP(obj, img, self.calib.K, self.calib.dist, rvec, tvec,
@@ -217,11 +258,21 @@ class TagTracker:
         return self.relative(seen)
 
     def relative(self, seen: dict[int, Sighting]) -> tuple[dict[str, Pose], ReferenceFit | None]:
+        """Poses in the reference frame by name: every visible tag under its own name, and every
+        body (fitted from all its visible tags) under the body's name. ``self.body_fits`` holds
+        each body's fit (which tags it used, residuals) for the last call."""
         fit = self.fit_reference(seen)
+        self.body_fits = {}
         if fit is None:
             return {}, None
         ref_inv = fit.cam_from_ref.inverse()
-        return {self.tags.name(i): ref_inv @ s.pose for i, s in seen.items()}, fit
+        out = {self.tags.name(i): ref_inv @ s.pose for i, s in seen.items()}
+        for body in self.tags.bodies:
+            bf = self.fit_body(seen, body)
+            if bf is not None:
+                self.body_fits[body] = bf
+                out[body] = ref_inv @ bf.cam_from_ref
+        return out, fit
 
 
 def survey(tags: TagSet, sightings: list[dict[int, Sighting]], outlier_m: float = 0.005) -> dict[int, Pose]:
@@ -246,6 +297,50 @@ def survey(tags: TagSet, sightings: list[dict[int, Sighting]], outlier_m: float 
         if keep:
             layout[i] = mean_pose(keep)[0]
     return layout
+
+
+def survey_body(ids, sightings: list[dict[int, Sighting]], outlier_m: float = 0.005,
+                min_pairs: int = 3) -> tuple[dict[int, Pose], dict]:
+    """Each tag of a rigid body in its anchor's (``ids[0]``) frame, from frames where tags of
+    the body are seen together.
+
+    Faces of a cube are only ever seen two or three at a time, so a face may never appear with
+    the anchor (the one opposite it, for one). Every pair seen together gives a relative pose
+    (averaged, outliers dropped as in ``survey``); the layout is then built outward from the
+    anchor along the best-observed pairs. Returns (layout, info) where info says, per tag, how
+    it was reached and from how many frames.
+    """
+    anchor = ids[0]
+    rel: dict[tuple[int, int], list[Pose]] = {}
+    for s in sightings:
+        vis = [i for i in ids if i in s]
+        for a in vis:
+            for b in vis:
+                if a != b:
+                    rel.setdefault((a, b), []).append(s[a].pose.inverse() @ s[b].pose)
+    pair: dict[tuple[int, int], tuple[Pose, int]] = {}
+    for k, ps in rel.items():
+        if len(ps) < min_pairs:
+            continue
+        med = np.median([p.t for p in ps], axis=0)
+        keep = [p for p in ps if np.linalg.norm(p.t - med) < outlier_m]
+        if len(keep) >= min_pairs:
+            pair[k] = (mean_pose(keep)[0], len(keep))
+    layout = {anchor: Pose(np.eye(3), np.zeros(3))}
+    info = {anchor: {"via": None, "frames": None}}
+    while True:
+        best = None
+        for (a, b), (p, n) in pair.items():
+            if a in layout and b not in layout and (best is None or n > best[2]):
+                best = (a, b, n, p)
+        if best is None:
+            break
+        a, b, n, p = best
+        layout[b] = layout[a] @ p
+        info[b] = {"via": a, "frames": n}
+    layout.pop(anchor)
+    info.pop(anchor)
+    return layout, info
 
 
 def mean_pose(poses: list[Pose]) -> tuple[Pose, np.ndarray]:
