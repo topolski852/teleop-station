@@ -183,6 +183,9 @@ def main() -> int:
     ap.add_argument("--final-vmax", type=float, default=5.0, help="poses: deg/s for the final approach")
     ap.add_argument("--settle", type=float, default=1.0, help="extra seconds after settling")
     ap.add_argument("--shots", type=int, default=5)
+    ap.add_argument("--measure", default=None, metavar="S1,S2,...",
+                    help="measure (encoders, camera) only at these stops; the arm still stops and settles at "
+                         "the others, so the motion is the same (default: every stop)")
     ap.add_argument("--camera", default="gphoto2:runs/shots_rep_{time}", help="camera source")
     ap.add_argument("--calib", default=str(ROOT / "calib" / "a7s3_sigma16_2768x1848.json"))
     ap.add_argument("--survey-shots", type=int, default=10)
@@ -234,7 +237,15 @@ def main() -> int:
         for label, target in stops:
             print(f"  {label:4s} " + "  ".join(f"{n.replace('_joint', '').replace('shoulder_', 'sh_')} {v / DEG:+6.1f}"
                                          for n, v in zip(names, target)))
-    cycle_t = sum(tr.duration for tr, _, _ in steps) + len(steps) * per_stop
+    labels = [l for l, _ in stops]
+    measured = labels if not a.measure else [l.strip() for l in a.measure.split(",") if l.strip()]
+    unknown = [l for l in measured if l not in labels]
+    if unknown:
+        sys.exit(f"--measure: no stop {unknown}; the stops are {labels}")
+    print(f"  measuring at {', '.join(measured)}" + ("" if len(measured) == len(labels) else
+          f"; passing through {', '.join(l for l in labels if l not in measured)} (stop and settle, no photos)"))
+    cycle_t = sum(tr.duration for tr, _, _ in steps) + sum(
+        per_stop if l in measured else 2.0 for _, l, _ in steps)
     print(f"  one cycle ~{cycle_t / 60:.1f} min ({sum(tr.duration for tr, _, _ in steps):.0f} s moving + "
           f"{per_stop:.0f} s per stop); {a.cycles} cycles ~{a.cycles * cycle_t / 60:.0f} min")
     if problems:
@@ -267,7 +278,7 @@ def main() -> int:
 
     out.write(json.dumps({"kind": "header", "started": stamp, "dry_run": a.dry_run, "args": vars(a),
                           "mode": "poses" if a.poses else "path", "names": names, "rest": rest.tolist(),
-                          "stops": [{"label": l, "target": t.tolist()} for l, t in stops],
+                          "stops": [{"label": l, "target": t.tolist()} for l, t in stops], "measured": measured,
                           "limits": {n: [limits.lower[n], limits.upper[n]] for n in names},
                           "camera_layout": cam.layout_json if cam else None}) + "\n")
     ticks = {"n": 0}
@@ -336,7 +347,9 @@ def main() -> int:
                                 f"put them where the recording started")
         ex.run(first_move(q0), vmax, amax)
         if first_measure:
-            measure(0, *first_measure, ex.settle())
+            st = ex.settle()
+            if first_measure[0] in measured:
+                measure(0, *first_measure, st)
         t_start = time.time()
         for c in range(cycles):
             if a.minutes is not None and c > 0 and time.time() - t_start >= a.minutes * 60:
@@ -344,7 +357,9 @@ def main() -> int:
                 break
             for tr, label, target in (steps_first if c == 0 else steps):
                 ex.run(tr, vmax, amax)
-                measure(c, label, target, ex.settle())
+                st = ex.settle()
+                if label in measured:
+                    measure(c, label, target, st)
         if a.path and lead_out and np.abs(ex.last_target - lead_out[0].q[0]).max() < 1e-6:
             for seg in lead_out:                       # back to rest along the recorded path
                 ex.run(seg, vmax, amax)
